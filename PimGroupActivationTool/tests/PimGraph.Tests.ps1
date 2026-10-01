@@ -1,0 +1,950 @@
+#Requires -Version 5.1
+#Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0.0' }
+
+BeforeAll {
+    $script:SrcPath = Join-Path -Path (Split-Path -Parent $PSScriptRoot) -ChildPath 'src'
+    Import-Module (Join-Path $script:SrcPath 'PimModels.psm1') -Force
+    Import-Module (Join-Path $script:SrcPath 'PimLogging.psm1') -Force
+    Import-Module (Join-Path $script:SrcPath 'PimGraph.psm1') -Force
+
+    # Keep unit tests off disk.
+    Initialize-PimLog -Disable | Out-Null
+
+    $script:CommercialCloud = Get-PimCloudConfiguration -Name 'Commercial'
+    $script:DodCloud        = Get-PimCloudConfiguration -Name 'US Government DoD'
+    $script:TenantId        = '11111111-1111-1111-1111-111111111111'
+    $script:PrincipalId     = '3cce9d87-3986-4f19-8335-7ed075408ca2'
+    $script:GroupId         = '14b9e371-5c2c-4ee5-a4a5-2980060d4f4e'
+    $script:GroupId2        = 'd5f0ad2e-6b34-401b-b6da-0c8fc2c5a3fc'
+}
+
+AfterAll {
+    Clear-PimCommandOverride
+    Remove-Module PimGraph, PimLogging, PimModels -Force -ErrorAction SilentlyContinue
+}
+
+# Pester does not allow BeforeEach/AfterEach directly in the file root, so the whole
+# suite lives inside a parent block that owns the per-test isolation.
+Describe 'PimGraph' {
+
+BeforeEach {
+    Clear-PimCommandOverride
+    Clear-PimGroupCache
+}
+
+Describe 'Invoke-PimExternalCommand' {
+    It 'routes to a registered override' {
+        Set-PimCommandOverride -Name 'Get-AzTenant' -Handler { param($p) 'overridden' }
+        Invoke-PimExternalCommand -Name 'Get-AzTenant' | Should -Be 'overridden'
+    }
+
+    It 'passes parameters to the override' {
+        Set-PimCommandOverride -Name 'Get-AzTenant' -Handler { param($p) $p['Marker'] }
+        Invoke-PimExternalCommand -Name 'Get-AzTenant' -Parameters @{ Marker = 'value' } | Should -Be 'value'
+    }
+
+    It 'throws an actionable error for a missing command' {
+        { Invoke-PimExternalCommand -Name 'Connect-NotARealCmdletAtAll' } | Should -Throw '*is not available*'
+    }
+
+    It 'removes an override when passed a null handler' {
+        Set-PimCommandOverride -Name 'Get-AzTenant' -Handler { param($p) 'x' }
+        Set-PimCommandOverride -Name 'Get-AzTenant' -Handler $null
+        { Invoke-PimExternalCommand -Name 'Get-AzTenant' -Parameters @{ ErrorAction = 'Stop' } } | Should -Not -Throw '*is not available*'
+    }
+}
+
+Describe 'Test-PimModuleAvailability' {
+    It 'reports a module as available when the installed version meets the minimum' {
+        $result = @(Test-PimModuleAvailability -RequiredModule @(
+            [pscustomobject]@{ Name = 'Pester'; MinimumVersion = '1.0.0'; InstallName = 'Pester'; Purpose = 'tests' }
+        ))
+        $result[0].IsAvailable | Should -BeTrue
+    }
+
+    It 'reports a missing module as unavailable' {
+        $result = @(Test-PimModuleAvailability -RequiredModule @(
+            [pscustomobject]@{ Name = 'Definitely.Not.Installed.Module'; MinimumVersion = '1.0.0'; InstallName = 'x'; Purpose = 'y' }
+        ))
+        $result[0].IsAvailable      | Should -BeFalse
+        $result[0].InstalledVersion | Should -BeNullOrEmpty
+    }
+
+    It 'reports an outdated module as unavailable' {
+        $result = @(Test-PimModuleAvailability -RequiredModule @(
+            [pscustomobject]@{ Name = 'Pester'; MinimumVersion = '99.0.0'; InstallName = 'Pester'; Purpose = 'tests' }
+        ))
+        $result[0].IsAvailable | Should -BeFalse
+    }
+
+    It 'declares both production prerequisites' {
+        (Get-PimRequiredModule).Name | Should -Be @('Az.Accounts', 'Microsoft.Graph.Authentication')
+    }
+}
+
+Describe 'Test-PimAzureContext' {
+    It 'rejects a null context' {
+        Test-PimAzureContext -Context $null -AzEnvironment 'AzureCloud' | Should -BeFalse
+    }
+
+    It 'rejects a context with no account' {
+        $context = [pscustomobject]@{ Account = $null; Environment = [pscustomobject]@{ Name = 'AzureCloud' } }
+        Test-PimAzureContext -Context $context -AzEnvironment 'AzureCloud' | Should -BeFalse
+    }
+
+    It 'rejects a context belonging to another cloud' {
+        $context = [pscustomobject]@{ Account = [pscustomobject]@{ Id = 'a@b.com' }; Environment = [pscustomobject]@{ Name = 'AzureCloud' } }
+        Test-PimAzureContext -Context $context -AzEnvironment 'AzureUSGovernment' | Should -BeFalse
+    }
+
+    It 'rejects a context whose token no longer works' {
+        Set-PimCommandOverride -Name 'Get-AzTenant' -Handler { param($p) throw 'Token expired' }
+        $context = [pscustomobject]@{ Account = [pscustomobject]@{ Id = 'a@b.com' }; Environment = [pscustomobject]@{ Name = 'AzureCloud' } }
+        Test-PimAzureContext -Context $context -AzEnvironment 'AzureCloud' | Should -BeFalse
+    }
+
+    It 'rejects a context that returns no tenants' {
+        Set-PimCommandOverride -Name 'Get-AzTenant' -Handler { param($p) @() }
+        $context = [pscustomobject]@{ Account = [pscustomobject]@{ Id = 'a@b.com' }; Environment = [pscustomobject]@{ Name = 'AzureCloud' } }
+        Test-PimAzureContext -Context $context -AzEnvironment 'AzureCloud' | Should -BeFalse
+    }
+
+    It 'accepts a validated context' {
+        Set-PimCommandOverride -Name 'Get-AzTenant' -Handler { param($p) @([pscustomobject]@{ TenantId = $script:TenantId }) }
+        $context = [pscustomobject]@{ Account = [pscustomobject]@{ Id = 'a@b.com' }; Environment = [pscustomobject]@{ Name = 'AzureCloud' } }
+        Test-PimAzureContext -Context $context -AzEnvironment 'AzureCloud' | Should -BeTrue
+    }
+
+    It 'accepts an environment supplied as a plain string' {
+        Set-PimCommandOverride -Name 'Get-AzTenant' -Handler { param($p) @([pscustomobject]@{ TenantId = $script:TenantId }) }
+        $context = [pscustomobject]@{ Account = 'a@b.com'; Environment = 'AzureCloud' }
+        Test-PimAzureContext -Context $context -AzEnvironment 'AzureCloud' | Should -BeTrue
+    }
+}
+
+Describe 'Connect-PimAzureAccount' {
+    BeforeEach {
+        $script:ConnectCalls = 0
+    }
+
+    It 'reuses a valid existing context without signing in again' {
+        Set-PimCommandOverride -Name 'Get-AzContext' -Handler { param($p)
+            [pscustomobject]@{
+                Account     = [pscustomobject]@{ Id = 'user@contoso.com' }
+                Environment = [pscustomobject]@{ Name = 'AzureCloud' }
+                Tenant      = [pscustomobject]@{ Id = '11111111-1111-1111-1111-111111111111' }
+            }
+        }
+        Set-PimCommandOverride -Name 'Get-AzTenant' -Handler { param($p) @([pscustomobject]@{ TenantId = '11111111-1111-1111-1111-111111111111' }) }
+        Set-PimCommandOverride -Name 'Connect-AzAccount' -Handler { param($p) throw 'Connect-AzAccount must not be called' }
+
+        $result = Connect-PimAzureAccount -CloudConfiguration $script:CommercialCloud
+        $result.ReusedContext | Should -BeTrue
+        $result.Account       | Should -Be 'user@contoso.com'
+        $result.Environment   | Should -Be 'AzureCloud'
+    }
+
+    It 'signs in when there is no context' {
+        $signedIn = $false
+        Set-PimCommandOverride -Name 'Get-AzContext' -Handler { param($p)
+            if ($script:SignedIn) {
+                return [pscustomobject]@{
+                    Account     = [pscustomobject]@{ Id = 'user@contoso.com' }
+                    Environment = [pscustomobject]@{ Name = 'AzureCloud' }
+                    Tenant      = [pscustomobject]@{ Id = '11111111-1111-1111-1111-111111111111' }
+                }
+            }
+            return $null
+        }
+        Set-PimCommandOverride -Name 'Connect-AzAccount' -Handler { param($p)
+            $script:SignedIn = $true
+            $script:ConnectParameters = $p
+            return [pscustomobject]@{}
+        }
+        Set-PimCommandOverride -Name 'Get-AzTenant' -Handler { param($p) @([pscustomobject]@{ TenantId = '11111111-1111-1111-1111-111111111111' }) }
+
+        $script:SignedIn = $false
+        $result = Connect-PimAzureAccount -CloudConfiguration $script:CommercialCloud
+
+        $result.ReusedContext | Should -BeFalse
+        $result.Account       | Should -Be 'user@contoso.com'
+    }
+
+    It 'signs in with the requested environment and process scope' {
+        Set-PimCommandOverride -Name 'Get-AzContext' -Handler { param($p)
+            if ($script:SignedIn) {
+                return [pscustomobject]@{ Account = [pscustomobject]@{ Id = 'u' }; Environment = [pscustomobject]@{ Name = 'AzureUSGovernment' }; Tenant = [pscustomobject]@{ Id = 't' } }
+            }
+            return $null
+        }
+        Set-PimCommandOverride -Name 'Connect-AzAccount' -Handler { param($p)
+            $script:SignedIn = $true
+            $script:ConnectParameters = $p
+        }
+        Set-PimCommandOverride -Name 'Get-AzTenant' -Handler { param($p) @([pscustomobject]@{ TenantId = 't' }) }
+
+        $script:SignedIn = $false
+        Connect-PimAzureAccount -CloudConfiguration $script:DodCloud | Out-Null
+
+        $script:ConnectParameters['Environment'] | Should -Be 'AzureUSGovernment'
+        $script:ConnectParameters['Scope']       | Should -Be 'Process'
+    }
+
+    It 'signs in again when a context belongs to a different cloud' {
+        Set-PimCommandOverride -Name 'Get-AzContext' -Handler { param($p)
+            if ($script:SignedIn) {
+                return [pscustomobject]@{ Account = [pscustomobject]@{ Id = 'u' }; Environment = [pscustomobject]@{ Name = 'AzureUSGovernment' }; Tenant = [pscustomobject]@{ Id = 't' } }
+            }
+            return [pscustomobject]@{ Account = [pscustomobject]@{ Id = 'u' }; Environment = [pscustomobject]@{ Name = 'AzureCloud' }; Tenant = [pscustomobject]@{ Id = 't' } }
+        }
+        Set-PimCommandOverride -Name 'Connect-AzAccount' -Handler { param($p) $script:SignedIn = $true }
+        Set-PimCommandOverride -Name 'Get-AzTenant' -Handler { param($p) @([pscustomobject]@{ TenantId = 't' }) }
+
+        $script:SignedIn = $false
+        (Connect-PimAzureAccount -CloudConfiguration $script:DodCloud).ReusedContext | Should -BeFalse
+        $script:SignedIn | Should -BeTrue
+    }
+
+    It 'forces a new sign-in when -Force is used' {
+        Set-PimCommandOverride -Name 'Get-AzContext' -Handler { param($p)
+            [pscustomobject]@{ Account = [pscustomobject]@{ Id = 'u' }; Environment = [pscustomobject]@{ Name = 'AzureCloud' }; Tenant = [pscustomobject]@{ Id = 't' } }
+        }
+        Set-PimCommandOverride -Name 'Connect-AzAccount' -Handler { param($p) $script:SignedIn = $true }
+        Set-PimCommandOverride -Name 'Get-AzTenant' -Handler { param($p) @([pscustomobject]@{ TenantId = 't' }) }
+
+        $script:SignedIn = $false
+        Connect-PimAzureAccount -CloudConfiguration $script:CommercialCloud -Force | Out-Null
+        $script:SignedIn | Should -BeTrue
+    }
+
+    It 'surfaces a friendly message when sign-in is cancelled' {
+        Set-PimCommandOverride -Name 'Get-AzContext' -Handler { param($p) $null }
+        Set-PimCommandOverride -Name 'Connect-AzAccount' -Handler { param($p) throw 'User canceled authentication: AuthenticationCanceled' }
+
+        { Connect-PimAzureAccount -CloudConfiguration $script:CommercialCloud } | Should -Throw '*cancelled*'
+    }
+
+    It 'throws when sign-in produces no context' {
+        Set-PimCommandOverride -Name 'Get-AzContext' -Handler { param($p) $null }
+        Set-PimCommandOverride -Name 'Connect-AzAccount' -Handler { param($p) }
+
+        { Connect-PimAzureAccount -CloudConfiguration $script:CommercialCloud } | Should -Throw '*did not produce a usable context*'
+    }
+
+    It 'refuses to sign in to an unsupported custom cloud' {
+        $unsupported = [pscustomobject]@{
+            DisplayName = 'Custom: Contoso'; AzEnvironment = 'Contoso'; GraphEnvironment = $null
+            GraphBaseUri = $null; IsBuiltIn = $false; IsSupported = $false
+            UnsupportedReason = 'No Microsoft Graph PowerShell environment is registered.'
+        }
+        { Connect-PimAzureAccount -CloudConfiguration $unsupported } | Should -Throw '*No Microsoft Graph PowerShell environment is registered*'
+    }
+}
+
+Describe 'Get-PimAuthorizedTenant' {
+    It 'normalizes and sorts discovered tenants' {
+        Set-PimCommandOverride -Name 'Get-AzTenant' -Handler { param($p)
+            @(
+                [pscustomobject]@{ TenantId = '22222222-2222-2222-2222-222222222222'; Name = 'Zulu';  Domains = @('zulu.com');  TenantCategory = 'ManagedBy' }
+                [pscustomobject]@{ TenantId = '11111111-1111-1111-1111-111111111111'; Name = 'Alpha'; Domains = @('alpha.com'); TenantCategory = 'Home' }
+            )
+        }
+
+        $tenants = Get-PimAuthorizedTenant -CloudConfiguration $script:CommercialCloud
+        $tenants.Count               | Should -Be 2
+        $tenants[0].TenantDisplayName | Should -Be 'Alpha'
+        $tenants[0].Cloud             | Should -Be 'Commercial'
+        $tenants[0].Selected          | Should -BeFalse
+    }
+
+    It 'returns an empty array rather than null when there are no tenants' {
+        Set-PimCommandOverride -Name 'Get-AzTenant' -Handler { param($p) @() }
+        $tenants = Get-PimAuthorizedTenant -CloudConfiguration $script:CommercialCloud
+        # Piping an empty array into Should sends nothing, so assert on the value itself.
+        ($tenants -is [array]) | Should -BeTrue -Because 'an empty array is still a non-null object'
+        $tenants.Count | Should -Be 0
+    }
+
+    It 'skips an unreadable tenant entry but keeps the rest' {
+        Set-PimCommandOverride -Name 'Get-AzTenant' -Handler { param($p)
+            @(
+                [pscustomobject]@{ Name = 'Broken, no id' }
+                [pscustomobject]@{ TenantId = '11111111-1111-1111-1111-111111111111'; Name = 'Good' }
+            )
+        }
+        $tenants = Get-PimAuthorizedTenant
+        $tenants.Count                | Should -Be 1
+        $tenants[0].TenantDisplayName | Should -Be 'Good'
+    }
+
+    It 'raises a friendly error when tenant discovery fails' {
+        Set-PimCommandOverride -Name 'Get-AzTenant' -Handler { param($p) throw 'Response status code does not indicate success: 403 (Forbidden)' }
+        { Get-PimAuthorizedTenant } | Should -Throw '*Could not list authorized tenants*'
+    }
+}
+
+Describe 'Test-PimGraphContext' {
+    BeforeAll {
+        $script:GoodContext = [pscustomobject]@{
+            TenantId    = '11111111-1111-1111-1111-111111111111'
+            Environment = 'Global'
+            Scopes      = @('PrivilegedEligibilitySchedule.Read.AzureADGroup', 'PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup')
+        }
+    }
+
+    It 'rejects a null context' {
+        Test-PimGraphContext -Context $null -TenantId $script:TenantId -GraphEnvironment 'Global' | Should -BeFalse
+    }
+
+    It 'rejects a context for a different tenant' {
+        Test-PimGraphContext -Context $script:GoodContext -TenantId '99999999-9999-9999-9999-999999999999' -GraphEnvironment 'Global' | Should -BeFalse
+    }
+
+    It 'rejects a context for a different Graph environment' {
+        Test-PimGraphContext -Context $script:GoodContext -TenantId $script:TenantId -GraphEnvironment 'USGovDoD' | Should -BeFalse
+    }
+
+    It 'rejects a context missing a required scope' {
+        Test-PimGraphContext -Context $script:GoodContext -TenantId $script:TenantId -GraphEnvironment 'Global' -RequiredScopes @('Group.Read.All') | Should -BeFalse
+    }
+
+    It 'accepts a matching context' {
+        Test-PimGraphContext -Context $script:GoodContext -TenantId $script:TenantId -GraphEnvironment 'Global' -RequiredScopes (Get-PimMinimumGraphScope) | Should -BeTrue
+    }
+
+    It 'matches the tenant ID case-insensitively' {
+        $context = [pscustomobject]@{ TenantId = 'AAAAAAAA-1111-1111-1111-111111111111'; Environment = 'Global'; Scopes = @() }
+        Test-PimGraphContext -Context $context -TenantId 'aaaaaaaa-1111-1111-1111-111111111111' -GraphEnvironment 'global' | Should -BeTrue
+    }
+}
+
+Describe 'Connect-PimGraphTenant' {
+    It 'connects with the full scope set and the correct environment' {
+        Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) $script:ConnectParameters = $p }
+        Set-PimCommandOverride -Name 'Get-MgContext' -Handler { param($p)
+            [pscustomobject]@{ TenantId = '11111111-1111-1111-1111-111111111111'; Environment = 'USGovDoD'; Account = 'u@contoso.com'; Scopes = @('PrivilegedEligibilitySchedule.Read.AzureADGroup', 'PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup', 'Group.Read.All') }
+        }
+
+        $result = Connect-PimGraphTenant -TenantId $script:TenantId -CloudConfiguration $script:DodCloud -Force
+
+        $result.Success      | Should -BeTrue
+        $result.HasGroupRead | Should -BeTrue
+        $script:ConnectParameters['Environment']  | Should -Be 'USGovDoD'
+        $script:ConnectParameters['ContextScope'] | Should -Be 'Process'
+        $script:ConnectParameters['TenantId']     | Should -Be $script:TenantId
+        $script:ConnectParameters['NoWelcome']    | Should -BeTrue
+        $script:ConnectParameters['Scopes']       | Should -Contain 'PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup'
+    }
+
+    It 'never passes a client secret or credential' {
+        Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) $script:ConnectParameters = $p }
+        Set-PimCommandOverride -Name 'Get-MgContext' -Handler { param($p)
+            [pscustomobject]@{ TenantId = '11111111-1111-1111-1111-111111111111'; Environment = 'Global'; Scopes = (Get-PimMinimumGraphScope) }
+        }
+
+        Connect-PimGraphTenant -TenantId $script:TenantId -CloudConfiguration $script:CommercialCloud -Force | Out-Null
+
+        foreach ($forbidden in 'ClientSecret', 'ClientSecretCredential', 'Credential', 'CertificateThumbprint', 'AccessToken', 'Certificate') {
+            $script:ConnectParameters.ContainsKey($forbidden) | Should -BeFalse -Because "$forbidden would break the delegated, no-app-registration design"
+        }
+    }
+
+    It 'reuses an existing matching context' {
+        Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) throw 'Connect-MgGraph must not be called' }
+        Set-PimCommandOverride -Name 'Get-MgContext' -Handler { param($p)
+            [pscustomobject]@{ TenantId = '11111111-1111-1111-1111-111111111111'; Environment = 'Global'; Scopes = (Get-PimDefaultGraphScope) }
+        }
+
+        $result = Connect-PimGraphTenant -TenantId $script:TenantId -CloudConfiguration $script:CommercialCloud
+        $result.Success | Should -BeTrue
+        $result.Message | Should -Match 'Reused'
+    }
+
+    It 'falls back to the minimum scopes when the full set is not consented' {
+        $script:Attempts = @()
+        Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p)
+            $script:Attempts += , @($p['Scopes'])
+            if (@($p['Scopes']).Count -gt 2) { throw 'AADSTS65001: The user or administrator has not consented to use the application.' }
+        }
+        Set-PimCommandOverride -Name 'Get-MgContext' -Handler { param($p)
+            [pscustomobject]@{ TenantId = '11111111-1111-1111-1111-111111111111'; Environment = 'Global'; Scopes = (Get-PimMinimumGraphScope) }
+        }
+
+        $result = Connect-PimGraphTenant -TenantId $script:TenantId -CloudConfiguration $script:CommercialCloud -Force
+
+        $result.Success      | Should -BeTrue
+        $result.HasGroupRead | Should -BeFalse
+        $result.Message      | Should -Match 'reduced permissions'
+        $script:Attempts.Count | Should -Be 2
+    }
+
+    It 'does not retry a non-consent failure' {
+        $script:CallCount = 0
+        Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p)
+            $script:CallCount++
+            throw 'AADSTS53003: Access has been blocked by Conditional Access policies.'
+        }
+        Set-PimCommandOverride -Name 'Get-MgContext' -Handler { param($p) $null }
+
+        $result = Connect-PimGraphTenant -TenantId $script:TenantId -CloudConfiguration $script:CommercialCloud -Force
+        $result.Success        | Should -BeFalse
+        $result.Message        | Should -Match 'Conditional Access'
+        $script:CallCount      | Should -Be 1
+    }
+
+    It 'returns a tenant-level failure instead of throwing' {
+        Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) throw "AADSTS50020: User account does not exist in tenant" }
+        Set-PimCommandOverride -Name 'Get-MgContext' -Handler { param($p) $null }
+
+        { $script:ConnectResult = Connect-PimGraphTenant -TenantId $script:TenantId -CloudConfiguration $script:CommercialCloud -Force } | Should -Not -Throw
+        $result = $script:ConnectResult
+        $result.Success  | Should -BeFalse
+        $result.TenantId | Should -Be $script:TenantId
+        $result.Message  | Should -Match 'does not have access to this tenant'
+    }
+
+    It 'fails when Graph connects to the wrong tenant' {
+        Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) }
+        Set-PimCommandOverride -Name 'Get-MgContext' -Handler { param($p)
+            [pscustomobject]@{ TenantId = '99999999-9999-9999-9999-999999999999'; Environment = 'Global'; Scopes = @() }
+        }
+
+        $result = Connect-PimGraphTenant -TenantId $script:TenantId -CloudConfiguration $script:CommercialCloud -Force
+        $result.Success | Should -BeFalse
+        $result.Detail  | Should -Match 'instead of tenant'
+    }
+
+    It 'fails when Graph connects to the wrong environment' {
+        Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) }
+        Set-PimCommandOverride -Name 'Get-MgContext' -Handler { param($p)
+            [pscustomobject]@{ TenantId = '11111111-1111-1111-1111-111111111111'; Environment = 'Global'; Scopes = @() }
+        }
+
+        $result = Connect-PimGraphTenant -TenantId $script:TenantId -CloudConfiguration $script:DodCloud -Force
+        $result.Success | Should -BeFalse
+        $result.Detail  | Should -Match 'instead of tenant'
+    }
+
+    It 'does not retry when the fallback scopes equal the requested scopes' {
+        $script:CallCount = 0
+        Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) $script:CallCount++; throw 'AADSTS65001: not consented' }
+        Set-PimCommandOverride -Name 'Get-MgContext' -Handler { param($p) $null }
+
+        Connect-PimGraphTenant -TenantId $script:TenantId -CloudConfiguration $script:CommercialCloud -Force `
+            -Scopes (Get-PimMinimumGraphScope) -FallbackScopes (Get-PimMinimumGraphScope) | Out-Null
+
+        $script:CallCount | Should -Be 1
+    }
+}
+
+Describe 'Compare-PimScopeSet' {
+    It 'treats differently ordered sets as equal' {
+        Compare-PimScopeSet -Left @('b', 'a') -Right @('a', 'b') | Should -BeTrue
+    }
+
+    It 'ignores case' {
+        Compare-PimScopeSet -Left @('Group.Read.All') -Right @('group.read.all') | Should -BeTrue
+    }
+
+    It 'detects a different size' {
+        Compare-PimScopeSet -Left @('a') -Right @('a', 'b') | Should -BeFalse
+    }
+
+    It 'detects different values' {
+        Compare-PimScopeSet -Left @('a', 'b') -Right @('a', 'c') | Should -BeFalse
+    }
+}
+
+Describe 'Invoke-PimGraphRequest' {
+    It 'combines a relative path with the Graph base URI' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p) @{ requestedUri = $p['Uri'] } }
+        $result = Invoke-PimGraphRequest -Uri '/v1.0/me' -GraphBaseUri 'https://dod-graph.microsoft.us/'
+        $result.requestedUri | Should -Be 'https://dod-graph.microsoft.us/v1.0/me'
+    }
+
+    It 'leaves an absolute URI untouched' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p) @{ requestedUri = $p['Uri'] } }
+        (Invoke-PimGraphRequest -Uri 'https://graph.microsoft.us/v1.0/me').requestedUri | Should -Be 'https://graph.microsoft.us/v1.0/me'
+    }
+
+    It 'requires a base URI for a relative path' {
+        { Invoke-PimGraphRequest -Uri '/v1.0/me' } | Should -Throw '*GraphBaseUri is required*'
+    }
+
+    It 'serializes a hashtable body to JSON' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p) @{ body = $p['Body']; contentType = $p['ContentType'] } }
+        $result = Invoke-PimGraphRequest -Uri 'https://graph.microsoft.com/v1.0/x' -Method POST -Body @{ action = 'selfActivate' }
+
+        $result.contentType            | Should -Be 'application/json'
+        ($result.body | ConvertFrom-Json).action | Should -Be 'selfActivate'
+    }
+
+    It 'passes a string body through unchanged' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p) @{ body = $p['Body'] } }
+        (Invoke-PimGraphRequest -Uri 'https://graph.microsoft.com/v1.0/x' -Method POST -Body '{"a":1}').body | Should -Be '{"a":1}'
+    }
+
+    It 'requests hashtable output so OData annotations survive' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p) @{ outputType = $p['OutputType'] } }
+        (Invoke-PimGraphRequest -Uri 'https://graph.microsoft.com/v1.0/x').outputType | Should -Be 'Hashtable'
+    }
+
+    It 'retries a throttled request and then succeeds' {
+        $script:Attempt = 0
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            $script:Attempt++
+            if ($script:Attempt -lt 3) { throw 'Response status code does not indicate success: 429 (TooManyRequests). Retry-After: 0' }
+            return @{ ok = $true }
+        }
+
+        (Invoke-PimGraphRequest -Uri 'https://graph.microsoft.com/v1.0/x' -InitialRetryDelaySeconds 0).ok | Should -BeTrue
+        $script:Attempt | Should -Be 3
+    }
+
+    It 'gives up after the retry budget is exhausted' {
+        $script:Attempt = 0
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            $script:Attempt++
+            throw 'Response status code does not indicate success: 503 (ServiceUnavailable). Retry-After: 0'
+        }
+
+        { Invoke-PimGraphRequest -Uri 'https://graph.microsoft.com/v1.0/x' -MaximumRetryCount 2 -InitialRetryDelaySeconds 0 } | Should -Throw
+        $script:Attempt | Should -Be 3
+    }
+
+    It 'does not retry a non-retryable error' {
+        $script:Attempt = 0
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            $script:Attempt++
+            throw '{"error":{"code":"Authorization_RequestDenied","message":"Insufficient privileges"}}'
+        }
+
+        { Invoke-PimGraphRequest -Uri 'https://graph.microsoft.com/v1.0/x' -InitialRetryDelaySeconds 0 } | Should -Throw
+        $script:Attempt | Should -Be 1
+    }
+}
+
+Describe 'Get-PimRetryDelaySecond' {
+    It 'returns null for a non-retryable error' {
+        Get-PimRetryDelaySecond -ErrorObject 'Authorization_RequestDenied' | Should -BeNullOrEmpty
+    }
+
+    It 'honors a Retry-After value found in the error text' {
+        Get-PimRetryDelaySecond -ErrorObject '429 TooManyRequests Retry-After: 17' | Should -Be 17
+    }
+
+    It 'backs off exponentially when no Retry-After is present' {
+        Get-PimRetryDelaySecond -ErrorObject '503 ServiceUnavailable' -Attempt 1 -InitialDelaySeconds 2 | Should -Be 2
+        Get-PimRetryDelaySecond -ErrorObject '503 ServiceUnavailable' -Attempt 2 -InitialDelaySeconds 2 | Should -Be 4
+        Get-PimRetryDelaySecond -ErrorObject '503 ServiceUnavailable' -Attempt 3 -InitialDelaySeconds 2 | Should -Be 8
+    }
+
+    It 'caps the delay' {
+        Get-PimRetryDelaySecond -ErrorObject '429 TooManyRequests Retry-After: 9999' -MaximumDelaySeconds 60 | Should -Be 60
+    }
+
+    It 'treats <Code> as retryable' -ForEach @(
+        @{ Code = '429' }, @{ Code = '500' }, @{ Code = '502' }, @{ Code = '503' }, @{ Code = '504' }
+    ) {
+        Get-PimRetryDelaySecond -ErrorObject "Request failed with status $Code" | Should -Not -BeNullOrEmpty
+    }
+
+    It 'treats <Code> as non-retryable' -ForEach @(
+        @{ Code = '400' }, @{ Code = '401' }, @{ Code = '403' }, @{ Code = '404' }
+    ) {
+        Get-PimRetryDelaySecond -ErrorObject "Request failed with status $Code" | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Get-PimGraphCollection' {
+    It 'follows @odata.nextLink across pages' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            switch ($p['Uri']) {
+                'https://graph.microsoft.com/page1' { return @{ value = @(@{ id = 1 }, @{ id = 2 }); '@odata.nextLink' = 'https://graph.microsoft.com/page2' } }
+                'https://graph.microsoft.com/page2' { return @{ value = @(@{ id = 3 }); '@odata.nextLink' = 'https://graph.microsoft.com/page3' } }
+                default                             { return @{ value = @(@{ id = 4 }) } }
+            }
+        }
+
+        $items = Get-PimGraphCollection -Uri 'https://graph.microsoft.com/page1'
+        $items.Count | Should -Be 4
+        @($items | ForEach-Object { $_['id'] }) | Should -Be @(1, 2, 3, 4)
+    }
+
+    It 'returns an empty array for an empty collection' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p) @{ value = @() } }
+        $items = Get-PimGraphCollection -Uri 'https://graph.microsoft.com/x'
+        $items.Count | Should -Be 0
+    }
+
+    It 'stops at the page limit to avoid an infinite loop' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            @{ value = @(@{ id = 1 }); '@odata.nextLink' = 'https://graph.microsoft.com/forever' }
+        }
+        $items = Get-PimGraphCollection -Uri 'https://graph.microsoft.com/forever' -MaximumPageCount 5
+        $items.Count | Should -Be 5
+    }
+}
+
+Describe 'Get-CurrentGraphUser' {
+    It 'returns the signed-in user identity' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            @{ id = '3cce9d87-3986-4f19-8335-7ed075408ca2'; userPrincipalName = 'u@contoso.com'; displayName = 'Test User' }
+        }
+
+        $user = Get-CurrentGraphUser -GraphBaseUri 'https://graph.microsoft.com'
+        $user.Id                | Should -Be '3cce9d87-3986-4f19-8335-7ed075408ca2'
+        $user.UserPrincipalName | Should -Be 'u@contoso.com'
+    }
+
+    It 'uses the supplied sovereign Graph host' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p) @{ id = 'x'; requestedUri = $p['Uri'] } }
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            $script:RequestedUri = $p['Uri']
+            @{ id = '3cce9d87-3986-4f19-8335-7ed075408ca2' }
+        }
+
+        Get-CurrentGraphUser -GraphBaseUri 'https://dod-graph.microsoft.us' | Out-Null
+        $script:RequestedUri | Should -BeLike 'https://dod-graph.microsoft.us/v1.0/me*'
+        $script:RequestedUri | Should -Not -BeLike '*graph.microsoft.com*'
+    }
+
+    It 'throws when Graph returns no object ID' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p) @{ displayName = 'No id' } }
+        { Get-CurrentGraphUser -GraphBaseUri 'https://graph.microsoft.com' } | Should -Throw '*did not return an object ID*'
+    }
+}
+
+Describe 'Resolve-PimGroup' {
+    It 'returns the display name and description' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            @{ id = $script:GroupId; displayName = 'PIM Test Group'; description = 'For testing' }
+        }
+
+        $group = Resolve-PimGroup -GroupId $script:GroupId -GraphBaseUri 'https://graph.microsoft.com' -TenantId $script:TenantId
+        $group.DisplayName | Should -Be 'PIM Test Group'
+        $group.Description | Should -Be 'For testing'
+        $group.Resolved    | Should -BeTrue
+    }
+
+    It 'falls back to the group ID when the directory read is denied' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p) throw '{"error":{"code":"Authorization_RequestDenied"}}' }
+
+        $group = Resolve-PimGroup -GroupId $script:GroupId -GraphBaseUri 'https://graph.microsoft.com' -TenantId $script:TenantId
+        $group.DisplayName | Should -Be $script:GroupId
+        $group.Resolved    | Should -BeFalse
+    }
+
+    It 'caches a resolved group so Graph is queried once' {
+        $script:Calls = 0
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            $script:Calls++
+            @{ id = $script:GroupId; displayName = 'Cached Group' }
+        }
+
+        Resolve-PimGroup -GroupId $script:GroupId -GraphBaseUri 'https://graph.microsoft.com' -TenantId $script:TenantId | Out-Null
+        Resolve-PimGroup -GroupId $script:GroupId -GraphBaseUri 'https://graph.microsoft.com' -TenantId $script:TenantId | Out-Null
+        $script:Calls | Should -Be 1
+    }
+
+    It 'keys the cache per tenant' {
+        $script:Calls = 0
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            $script:Calls++
+            @{ id = $script:GroupId; displayName = "Group $($script:Calls)" }
+        }
+
+        Resolve-PimGroup -GroupId $script:GroupId -GraphBaseUri 'https://graph.microsoft.com' -TenantId 'tenant-a' | Out-Null
+        Resolve-PimGroup -GroupId $script:GroupId -GraphBaseUri 'https://graph.microsoft.com' -TenantId 'tenant-b' | Out-Null
+        $script:Calls | Should -Be 2
+    }
+}
+
+Describe 'Get-PimEligibleGroups' {
+    BeforeEach {
+        $script:EligibilityResponse = @{
+            value = @(
+                @{
+                    id          = "$($script:GroupId)_member_f9003cf6-8905-4c69-a9f8-fd6d04caec69"
+                    principalId = $script:PrincipalId
+                    groupId     = $script:GroupId
+                    accessId    = 'member'
+                    status      = 'Provisioned'
+                    memberType  = 'direct'
+                    scheduleInfo = @{
+                        startDateTime = '2026-01-01T00:00:00Z'
+                        expiration    = @{ type = 'afterDateTime'; endDateTime = '2027-01-01T00:00:00Z' }
+                    }
+                }
+            )
+        }
+    }
+
+    It 'uses filterByCurrentUser first' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            $script:RequestedUris += $p['Uri']
+            if ($p['Uri'] -like '*filterByCurrentUser*') { return $script:EligibilityResponse }
+            return @{ id = $script:GroupId; displayName = 'PIM Test Group' }
+        }
+        $script:RequestedUris = @()
+
+        $groups = Get-PimEligibleGroups -TenantId $script:TenantId -PrincipalId $script:PrincipalId -GraphBaseUri 'https://graph.microsoft.com' -TenantDisplayName 'Contoso'
+
+        $script:RequestedUris[0] | Should -BeLike "*filterByCurrentUser(on='principal')*"
+        $groups.Count            | Should -Be 1
+        $groups[0].GroupDisplayName | Should -Be 'PIM Test Group'
+        $groups[0].AccessId         | Should -Be 'member'
+        $groups[0].TenantDisplayName | Should -Be 'Contoso'
+        $groups[0].Selected          | Should -BeFalse
+        $groups[0].EndDateTime       | Should -Be '2027-01-01T00:00:00Z'
+    }
+
+    It 'falls back to the principalId filter when filterByCurrentUser is unavailable' {
+        $script:RequestedUris = @()
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            $script:RequestedUris += $p['Uri']
+            if ($p['Uri'] -like '*filterByCurrentUser*') { throw '{"error":{"code":"Request_BadRequest","message":"not supported"}}' }
+            if ($p['Uri'] -like '*eligibilitySchedules*')  { return $script:EligibilityResponse }
+            return @{ id = $script:GroupId; displayName = 'PIM Test Group' }
+        }
+
+        $groups = Get-PimEligibleGroups -TenantId $script:TenantId -PrincipalId $script:PrincipalId -GraphBaseUri 'https://graph.microsoft.com'
+
+        $script:RequestedUris[1] | Should -BeLike "*`$filter=principalId eq '$($script:PrincipalId)'*"
+        $groups.Count            | Should -Be 1
+    }
+
+    It 'uses the sovereign Graph host for every call' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            $script:RequestedUris += $p['Uri']
+            if ($p['Uri'] -like '*filterByCurrentUser*') { return $script:EligibilityResponse }
+            return @{ id = $script:GroupId; displayName = 'PIM Test Group' }
+        }
+        $script:RequestedUris = @()
+
+        Get-PimEligibleGroups -TenantId $script:TenantId -PrincipalId $script:PrincipalId -GraphBaseUri 'https://dod-graph.microsoft.us' | Out-Null
+
+        foreach ($uri in $script:RequestedUris) {
+            $uri | Should -BeLike 'https://dod-graph.microsoft.us/*'
+        }
+    }
+
+    It 'prefers an expanded group object over a separate lookup' {
+        $script:EligibilityResponse.value[0]['group'] = @{ id = $script:GroupId; displayName = 'Expanded Name'; description = 'Expanded description' }
+        $script:LookupCalls = 0
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            if ($p['Uri'] -like '*filterByCurrentUser*') { return $script:EligibilityResponse }
+            $script:LookupCalls++
+            return @{ id = $script:GroupId; displayName = 'Should not be used' }
+        }
+
+        $groups = Get-PimEligibleGroups -TenantId $script:TenantId -PrincipalId $script:PrincipalId -GraphBaseUri 'https://graph.microsoft.com'
+        $groups[0].GroupDisplayName | Should -Be 'Expanded Name'
+        $groups[0].GroupDescription | Should -Be 'Expanded description'
+        $script:LookupCalls         | Should -Be 0
+    }
+
+    It 'returns an empty array when the user has no eligible groups' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p) @{ value = @() } }
+        $groups = Get-PimEligibleGroups -TenantId $script:TenantId -PrincipalId $script:PrincipalId -GraphBaseUri 'https://graph.microsoft.com'
+        $groups.Count | Should -Be 0
+    }
+
+    It 'returns both member and owner eligibilities, sorted' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            if ($p['Uri'] -like '*filterByCurrentUser*') {
+                return @{ value = @(
+                    @{ id = 's2'; principalId = $script:PrincipalId; groupId = $script:GroupId2; accessId = 'owner';  status = 'Provisioned' }
+                    @{ id = 's1'; principalId = $script:PrincipalId; groupId = $script:GroupId;  accessId = 'member'; status = 'Provisioned' }
+                ) }
+            }
+            if ($p['Uri'] -like "*$($script:GroupId2)*") { return @{ displayName = 'Zeta Group' } }
+            return @{ displayName = 'Alpha Group' }
+        }
+
+        $groups = Get-PimEligibleGroups -TenantId $script:TenantId -PrincipalId $script:PrincipalId -GraphBaseUri 'https://graph.microsoft.com'
+        $groups.Count               | Should -Be 2
+        $groups[0].GroupDisplayName | Should -Be 'Alpha Group'
+        $groups[0].AccessId         | Should -Be 'member'
+        $groups[1].AccessId         | Should -Be 'owner'
+    }
+
+    It 'ignores an eligibility that belongs to another principal' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            if ($p['Uri'] -like '*filterByCurrentUser*') {
+                return @{ value = @(@{ id = 's1'; principalId = '99999999-9999-9999-9999-999999999999'; groupId = $script:GroupId; accessId = 'member' }) }
+            }
+            return @{ displayName = 'x' }
+        }
+
+        (Get-PimEligibleGroups -TenantId $script:TenantId -PrincipalId $script:PrincipalId -GraphBaseUri 'https://graph.microsoft.com').Count | Should -Be 0
+    }
+
+    It 'skips an eligibility with an unsupported access type' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            if ($p['Uri'] -like '*filterByCurrentUser*') {
+                return @{ value = @(@{ id = 's1'; principalId = $script:PrincipalId; groupId = $script:GroupId; accessId = 'somethingNew' }) }
+            }
+            return @{ displayName = 'x' }
+        }
+
+        (Get-PimEligibleGroups -TenantId $script:TenantId -PrincipalId $script:PrincipalId -GraphBaseUri 'https://graph.microsoft.com').Count | Should -Be 0
+    }
+
+    It 'skips an eligibility with no group ID' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            if ($p['Uri'] -like '*filterByCurrentUser*') {
+                return @{ value = @(@{ id = 's1'; principalId = $script:PrincipalId; accessId = 'member' }) }
+            }
+            return @{ displayName = 'x' }
+        }
+
+        (Get-PimEligibleGroups -TenantId $script:TenantId -PrincipalId $script:PrincipalId -GraphBaseUri 'https://graph.microsoft.com').Count | Should -Be 0
+    }
+
+    It 'shows the group ID when name resolution is skipped' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            if ($p['Uri'] -like '*filterByCurrentUser*') { return $script:EligibilityResponse }
+            throw 'Group lookup must not happen'
+        }
+
+        $groups = Get-PimEligibleGroups -TenantId $script:TenantId -PrincipalId $script:PrincipalId -GraphBaseUri 'https://graph.microsoft.com' -SkipGroupNameResolution
+        $groups[0].GroupDisplayName | Should -Be $script:GroupId
+    }
+
+    It 'raises a friendly error when both query forms fail' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p) throw '{"error":{"code":"Authorization_RequestDenied","message":"Insufficient privileges"}}' }
+        { Get-PimEligibleGroups -TenantId $script:TenantId -PrincipalId $script:PrincipalId -GraphBaseUri 'https://graph.microsoft.com' } |
+            Should -Throw '*Could not read eligible groups*'
+    }
+}
+
+Describe 'Request-PimGroupActivation' {
+    BeforeEach {
+        $script:ActivationArgs = @{
+            TenantId          = $script:TenantId
+            TenantDisplayName = 'Contoso'
+            PrincipalId       = $script:PrincipalId
+            GroupId           = $script:GroupId
+            GroupDisplayName  = 'PIM Test Group'
+            AccessId          = 'member'
+            Justification     = 'Investigating incident 123'
+            Duration          = [timespan]::FromHours(2)
+            GraphBaseUri      = 'https://graph.microsoft.com'
+        }
+    }
+
+    It 'posts to the assignmentScheduleRequests endpoint and reports success' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            $script:PostUri    = $p['Uri']
+            $script:PostMethod = $p['Method']
+            $script:PostBody   = $p['Body'] | ConvertFrom-Json
+            return @{ id = 'request-123'; status = 'Provisioned' }
+        }
+
+        $result = Request-PimGroupActivation @script:ActivationArgs
+
+        $script:PostMethod | Should -Be 'POST'
+        $script:PostUri    | Should -Be 'https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/assignmentScheduleRequests'
+        $script:PostBody.action   | Should -Be 'selfActivate'
+        $script:PostBody.groupId  | Should -Be $script:GroupId
+        $script:PostBody.scheduleInfo.expiration.duration | Should -Be 'PT2H'
+
+        $result.Status    | Should -Be 'Success'
+        $result.RequestId | Should -Be 'request-123'
+        $result.Message   | Should -Match 'Provisioned'
+    }
+
+    It 'uses the sovereign Graph host' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p) $script:PostUri = $p['Uri']; @{ id = 'r' } }
+        $args = $script:ActivationArgs.Clone()
+        $args['GraphBaseUri'] = 'https://graph.microsoft.us'
+
+        Request-PimGroupActivation @args | Out-Null
+        $script:PostUri | Should -BeLike 'https://graph.microsoft.us/*'
+    }
+
+    It 'includes ticket information when supplied' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p) $script:PostBody = $p['Body'] | ConvertFrom-Json; @{ id = 'r' } }
+        $args = $script:ActivationArgs.Clone()
+        $args['TicketNumber'] = 'INC42'
+        $args['TicketSystem'] = 'ServiceNow'
+
+        Request-PimGroupActivation @args | Out-Null
+        $script:PostBody.ticketInfo.ticketNumber | Should -Be 'INC42'
+    }
+
+    It 'returns a failure record instead of throwing when Graph rejects the request' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            throw '{"error":{"code":"RoleAssignmentRequestPolicyValidationFailed","message":"The duration specified exceeds the maximum allowed"}}'
+        }
+
+        { $script:ActivationResult = Request-PimGroupActivation @script:ActivationArgs } | Should -Not -Throw
+        $result = $script:ActivationResult
+        $result.Status  | Should -Be 'Failed'
+        $result.Message | Should -Match 'duration exceeds the activation policy'
+        $result.Detail  | Should -Match 'RoleAssignmentRequestPolicyValidationFailed'
+    }
+
+    It 'reports a policy ticket requirement in an actionable way' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            throw '{"error":{"code":"RoleAssignmentRequestTicketInfoRequired","message":"Ticket information is required"}}'
+        }
+        (Request-PimGroupActivation @script:ActivationArgs).Message | Should -Match 'ticket information'
+    }
+
+    It 'returns a failure record for an invalid payload without calling Graph' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p) throw 'Graph must not be called' }
+        $args = $script:ActivationArgs.Clone()
+        $args['GroupId'] = 'not-a-guid'
+
+        $result = Request-PimGroupActivation @args
+        $result.Status  | Should -Be 'Failed'
+        $result.Message | Should -Match 'GroupId must be a GUID'
+    }
+
+    It 'honors -WhatIf and does not call Graph' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p) throw 'Graph must not be called' }
+        $result = Request-PimGroupActivation @script:ActivationArgs -WhatIf
+        $result.Status | Should -Be 'Skipped'
+    }
+
+    It 'redacts a token that appears in a Graph failure' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            throw 'Request failed. Authorization: Bearer AbCdEf0123456789AbCdEf0123456789 was rejected'
+        }
+        $result = Request-PimGroupActivation @script:ActivationArgs
+        $result.Detail  | Should -Not -Match 'AbCdEf0123456789AbCdEf0123456789'
+        $result.Message | Should -Not -Match 'AbCdEf0123456789AbCdEf0123456789'
+    }
+}
+
+Describe 'Get-PimActiveGroupAssignment' {
+    It 'returns active assignments' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            @{ value = @(@{ groupId = $script:GroupId; accessId = 'member'; assignmentType = 'activated'; status = 'Provisioned'; memberType = 'direct' }) }
+        }
+
+        $active = Get-PimActiveGroupAssignment -GraphBaseUri 'https://graph.microsoft.com' -TenantId $script:TenantId
+        $active.Count             | Should -Be 1
+        $active[0].AssignmentType | Should -Be 'activated'
+    }
+
+    It 'returns an empty array instead of failing when the query is not permitted' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p) throw '{"error":{"code":"Authorization_RequestDenied"}}' }
+        $active = Get-PimActiveGroupAssignment -GraphBaseUri 'https://graph.microsoft.com'
+        $active.Count | Should -Be 0
+    }
+}
+
+Describe 'Get-PimSafeUri' {
+    It 'strips the query string so filters are not logged' {
+        Get-PimSafeUri -Uri "https://graph.microsoft.com/v1.0/x?`$filter=principalId eq 'abc'" | Should -Be 'https://graph.microsoft.com/v1.0/x'
+    }
+
+    It 'leaves a URI without a query alone' {
+        Get-PimSafeUri -Uri 'https://graph.microsoft.com/v1.0/me' | Should -Be 'https://graph.microsoft.com/v1.0/me'
+    }
+}
+
+} # Describe 'PimGraph'

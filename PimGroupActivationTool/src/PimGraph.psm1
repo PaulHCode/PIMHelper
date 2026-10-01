@@ -873,9 +873,14 @@ function Get-PimGraphCollection {
 
         $response = Invoke-PimGraphRequest -Uri $nextUri -Method GET -GraphBaseUri $GraphBaseUri
 
-        $value = Get-PimPropertyValue -InputObject $response -Name 'value'
-        if ($null -ne $value) {
-            foreach ($item in @($value)) { $items.Add($item) }
+        # A collection response always carries a 'value' property, even when it is empty.
+        # Checking for the property (rather than a non-null value) keeps an empty page from
+        # being misread as a single-object response.
+        if (Test-PimPropertyExists -InputObject $response -Name 'value') {
+            $value = Get-PimPropertyValue -InputObject $response -Name 'value'
+            if ($null -ne $value) {
+                foreach ($item in @($value)) { $items.Add($item) }
+            }
         }
         elseif ($null -ne $response) {
             $items.Add($response)
@@ -1026,7 +1031,9 @@ function Get-PimEligibleGroups {
     $lastError = $null
     foreach ($query in $queries) {
         try {
-            $schedules = @(Get-PimGraphCollection -Uri $query)
+            # No @() wrapper: Get-PimGraphCollection emits its array as a single pipeline
+            # item, and @() would nest it one level deeper instead of flattening it.
+            $schedules = Get-PimGraphCollection -Uri $query
             $lastError = $null
             break
         }
@@ -1248,7 +1255,7 @@ function Get-PimActiveGroupAssignment {
     $uri = "$baseUri/v1.0/identityGovernance/privilegedAccess/group/assignmentSchedules/filterByCurrentUser(on='principal')"
 
     try {
-        $schedules = @(Get-PimGraphCollection -Uri $uri)
+        $schedules = Get-PimGraphCollection -Uri $uri
     }
     catch {
         Write-PimLog -Level Debug -Operation 'Get-Active' -TenantId $TenantId -Message "Could not read active assignments: $($_.Exception.Message)"

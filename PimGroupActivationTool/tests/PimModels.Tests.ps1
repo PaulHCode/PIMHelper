@@ -200,6 +200,32 @@ Describe 'Get-PimPropertyValue' {
     }
 }
 
+Describe 'Test-PimPropertyExists' {
+    It 'distinguishes an empty collection property from a missing one' {
+        $response = @{ value = @() }
+        Test-PimPropertyExists -InputObject $response -Name 'value'       | Should -BeTrue
+        Test-PimPropertyExists -InputObject $response -Name '@odata.nextLink' | Should -BeFalse
+    }
+
+    It 'matches hashtable keys case-insensitively' {
+        Test-PimPropertyExists -InputObject @{ DisplayName = 'x' } -Name 'displayname' | Should -BeTrue
+    }
+
+    It 'matches PSObject properties case-insensitively' {
+        $object = [pscustomobject]@{ DisplayName = 'x' }
+        Test-PimPropertyExists -InputObject $object -Name 'displayname' | Should -BeTrue
+        Test-PimPropertyExists -InputObject $object -Name 'missing'     | Should -BeFalse
+    }
+
+    It 'returns false for a null input object' {
+        Test-PimPropertyExists -InputObject $null -Name 'value' | Should -BeFalse
+    }
+
+    It 'returns true even when the property value is null' {
+        Test-PimPropertyExists -InputObject @{ value = $null } -Name 'value' | Should -BeTrue
+    }
+}
+
 Describe 'Get-PimFirstPropertyValue' {
     It 'returns the first non-empty candidate' {
         $object = [pscustomobject]@{ Id = ''; TenantId = 'tid' }

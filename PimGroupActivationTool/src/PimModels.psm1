@@ -296,6 +296,47 @@ function Get-PimPropertyValue {
     return $null
 }
 
+function Test-PimPropertyExists {
+    <#
+    .SYNOPSIS
+        Returns $true when an object, hashtable, or PSObject defines the named property.
+
+    .DESCRIPTION
+        Distinguishes "property is absent" from "property is present but empty or null",
+        which Get-PimPropertyValue cannot express because an empty array is indistinguishable
+        from $null once it leaves the pipeline.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter()]
+        [AllowNull()]
+        [object] $InputObject,
+
+        [Parameter(Mandatory)]
+        [string] $Name
+    )
+
+    if ($null -eq $InputObject) { return $false }
+
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        foreach ($key in $InputObject.Keys) {
+            if ([string]::Equals([string]$key, $Name, [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $true
+            }
+        }
+        return $false
+    }
+
+    foreach ($candidate in $InputObject.PSObject.Properties) {
+        if ([string]::Equals($candidate.Name, $Name, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
 function Get-PimFirstPropertyValue {
     <#
     .SYNOPSIS
@@ -1057,6 +1098,7 @@ Export-ModuleMember -Function @(
     'New-PimCustomCloudConfiguration'
     'Format-PimBaseUri'
     'Get-PimPropertyValue'
+    'Test-PimPropertyExists'
     'Get-PimFirstPropertyValue'
     'Get-PimDurationOption'
     'ConvertTo-Iso8601Duration'
