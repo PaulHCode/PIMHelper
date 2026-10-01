@@ -15,6 +15,10 @@ BeforeAll {
     $script:SrcPath = Join-Path -Path (Split-Path -Parent $PSScriptRoot) -ChildPath 'src'
     $script:SourceFiles = @(Get-ChildItem -Path $script:SrcPath -Filter '*.psm1')
 
+    # The entry script calls the same functions, so the call-site rules must cover it too.
+    $script:EntryScript = Get-Item -LiteralPath (Join-Path -Path (Split-Path -Parent $PSScriptRoot) -ChildPath 'Start-PimGroupActivationTool.ps1')
+    $script:CallSiteFiles = @($script:SourceFiles) + @($script:EntryScript)
+
     $script:CommaReturningFunctions = New-Object System.Collections.Generic.List[string]
     foreach ($file in $script:SourceFiles) {
         $ast = [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$null)
@@ -37,7 +41,7 @@ Describe 'Source conventions' {
         $pattern = '@\(\s*(' + ($names -join '|') + ')\b'
 
         $offenders = New-Object System.Collections.Generic.List[string]
-        foreach ($file in $script:SourceFiles) {
+        foreach ($file in $script:CallSiteFiles) {
             $lineNumber = 0
             foreach ($line in (Get-Content -LiteralPath $file.FullName)) {
                 $lineNumber++
@@ -48,6 +52,27 @@ Describe 'Source conventions' {
         }
 
         $offenders -join "`n" | Should -BeNullOrEmpty -Because 'wrapping these calls in @() nests the array instead of flattening it'
+    }
+
+    It 'never pipes a comma-returning function directly into another command' {
+        # Piping has the same hazard as @(): the comma-wrapped array arrives as a single
+        # pipeline item, so Where-Object/ForEach-Object see one Object[] rather than each
+        # record. Assign to a variable first, then pipe the variable.
+        $names = @($script:CommaReturningFunctions | Sort-Object -Unique)
+        $pattern = '(?<![$\w.-])(' + ($names -join '|') + ')\b[^|)\r\n]*\|\s*(Where-Object|ForEach-Object|Select-Object|Sort-Object|Group-Object|Measure-Object|\?|%)\b'
+
+        $offenders = New-Object System.Collections.Generic.List[string]
+        foreach ($file in $script:CallSiteFiles) {
+            $lineNumber = 0
+            foreach ($line in (Get-Content -LiteralPath $file.FullName)) {
+                $lineNumber++
+                if ($line -match $pattern) {
+                    $offenders.Add("$($file.Name):$lineNumber $($line.Trim())")
+                }
+            }
+        }
+
+        $offenders -join "`n" | Should -BeNullOrEmpty -Because 'the comma-wrapped array arrives as one pipeline item instead of one item per record'
     }
 
     It 'parses every source file without errors' {

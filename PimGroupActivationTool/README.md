@@ -92,6 +92,7 @@ pipeline, or when you just want one group activated quickly.
 | `-TicketNumber`, `-TicketSystem` | `-Activate` | Optional, recorded with the request when your policy asks for a ticket. |
 | `-LogPath` | all | Overrides the log file location. |
 | `-NoLog` | all | Disables file logging for this run. |
+| `-UseDeviceAuthentication` | all | Signs in with a device code instead of a browser. Use this over SSH or in a session with no browser. |
 | `-SkipModuleCheck` | all | Skips the prerequisite check. |
 
 ---
@@ -104,21 +105,22 @@ The tool requests these **delegated** Microsoft Graph scopes:
 |---|---|
 | `PrivilegedEligibilitySchedule.Read.AzureADGroup` | Read your eligible group assignments. |
 | `PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup` | Submit the activation request. |
+| `User.Read` | Read your own object ID, which every eligibility query is filtered by. |
 | `Group.Read.All` | Resolve group **display names**. Optional. |
 
 These are delegated scopes, so the tool can never do anything you could not already do in
 the Entra portal yourself.
 
 If a tenant will not consent to `Group.Read.All` — common for guests — the tool
-automatically retries with only the two `Privileged*` scopes and carries on. Groups are
-then shown by object ID instead of display name. You will see a warning saying so.
+automatically retries without it and carries on. Groups are then shown by object ID
+instead of display name. You will see a warning saying so.
 
 If consent is blocked entirely in a tenant, a Global Administrator or Privileged Role
 Administrator there must consent to the Microsoft Graph PowerShell application
 (`14d82eec-204b-4c2f-b7e8-296a70dab67e`) for those scopes. An admin can pre-consent with:
 
 ```powershell
-Connect-MgGraph -TenantId <tenant> -Scopes 'PrivilegedEligibilitySchedule.Read.AzureADGroup','PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup','Group.Read.All'
+Connect-MgGraph -TenantId <tenant> -Scopes 'PrivilegedEligibilitySchedule.Read.AzureADGroup','PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup','Group.Read.All','User.Read'
 ```
 
 ---
@@ -222,12 +224,17 @@ which is why the model tests make up most of the suite. `PimGraph.psm1` routes e
 Azure and Graph cmdlet through `Invoke-PimExternalCommand`, so its tests register fakes
 with `Set-PimCommandOverride` and run without `Az` or `Microsoft.Graph` installed.
 
-`SourceConventions.Tests.ps1` is static analysis, not behaviour. It guards two bug
-classes that cost real debugging time during development:
+`SourceConventions.Tests.ps1` is static analysis, not behaviour. It guards bug classes
+that cost real debugging time during development:
 
 - Wrapping a comma-returning function call in `@()`. A function ending in
   `return , ([object[]]$x)` emits its array as a *single* pipeline item, so `@(f)` nests
   instead of flattening and silently drops every record.
+- Piping such a function straight into `Where-Object`/`ForEach-Object`. Same cause: the
+  downstream cmdlet receives one `Object[]` rather than one item per record, so a filter
+  like `Get-PimAvailableCloudConfiguration | Where-Object { $_.DisplayName -eq 'Commercial' }`
+  returns the whole array instead of one cloud. Assign to a variable first, then pipe or
+  `foreach` over the variable.
 - `GetNewClosure()`. It rebinds a scriptblock to a new dynamic module, which breaks
   resolution of functions imported as nested modules.
 
