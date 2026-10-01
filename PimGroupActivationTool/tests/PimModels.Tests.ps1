@@ -176,6 +176,26 @@ Describe 'Get-PimCloudConfiguration' {
 
         ($clouds | Where-Object { -not $_.IsBuiltIn }).GraphBaseUri | Should -Be 'https://graph.contoso.example'
     }
+
+    It 'gives built-in and custom records an identical property set' {
+        # Callers select a cloud by walking this list, so a shape difference between
+        # built-in and custom records breaks the picker under StrictMode.
+        $clouds = @(Get-PimCloudConfiguration `
+            -AzEnvironment @([pscustomobject]@{ Name = 'ContosoSovereign' }) `
+            -GraphEnvironment @([pscustomobject]@{ Name = 'ContosoSovereign'; GraphEndpoint = 'https://graph.contoso.example' }))
+
+        $expected = @('AzEnvironment', 'DisplayName', 'GraphBaseUri', 'GraphEnvironment', 'IsBuiltIn', 'IsSupported', 'UnsupportedReason')
+        foreach ($cloud in $clouds) {
+            $actual = @($cloud.PSObject.Properties.Name | Sort-Object)
+            ($actual -join ',') | Should -Be ($expected -join ',') -Because "cloud '$($cloud.DisplayName)' must match the shared shape"
+        }
+    }
+
+    It 'never exposes a Name property, so callers must match on DisplayName' {
+        foreach ($cloud in (Get-PimCloudConfiguration)) {
+            $cloud.PSObject.Properties['Name'] | Should -BeNullOrEmpty
+        }
+    }
 }
 
 Describe 'Get-PimPropertyValue' {

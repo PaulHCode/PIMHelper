@@ -96,3 +96,54 @@ Describe 'Source conventions' {
         }
     }
 }
+
+Describe 'Entry script' {
+    BeforeAll {
+        $script:EntryPath = Join-Path -Path (Split-Path -Parent $PSScriptRoot) -ChildPath 'Start-PimGroupActivationTool.ps1'
+    }
+
+    It 'exists next to the src folder' {
+        Test-Path -LiteralPath $script:EntryPath | Should -BeTrue
+    }
+
+    It 'parses without errors' {
+        $errors = $null
+        $null = [System.Management.Automation.Language.Parser]::ParseFile($script:EntryPath, [ref]$null, [ref]$errors)
+        ($errors | ForEach-Object { "$($_.Extent.StartLineNumber) $($_.Message)" }) -join "`n" | Should -BeNullOrEmpty
+    }
+
+    It 'exposes the GUI and headless parameter sets' {
+        $command = Get-Command -Name $script:EntryPath
+        $names = @($command.ParameterSets | ForEach-Object { $_.Name })
+
+        $names | Should -Contain 'Gui'
+        $names | Should -Contain 'ListTenants'
+        $names | Should -Contain 'ListGroups'
+        $names | Should -Contain 'ListActive'
+        $names | Should -Contain 'Activate'
+
+        ($command.ParameterSets | Where-Object { $_.IsDefault }).Name | Should -Be 'Gui'
+    }
+
+    It 'requires a tenant, group, and justification to activate' {
+        $command = Get-Command -Name $script:EntryPath
+        $activateSet = $command.ParameterSets | Where-Object { $_.Name -eq 'Activate' }
+        $mandatory = @($activateSet.Parameters | Where-Object { $_.IsMandatory } | ForEach-Object { $_.Name })
+
+        $mandatory | Should -Contain 'TenantId'
+        $mandatory | Should -Contain 'GroupId'
+        $mandatory | Should -Contain 'Justification'
+    }
+
+    It 'documents every parameter set with an example' {
+        $help = Get-Help -Name $script:EntryPath
+        @($help.examples.example).Count | Should -BeGreaterOrEqual 4
+    }
+
+    It 'references only module files that exist' {
+        $content = Get-Content -LiteralPath $script:EntryPath -Raw
+        foreach ($name in [regex]::Matches($content, "'(Pim\w+\.psm1)'") | ForEach-Object { $_.Groups[1].Value }) {
+            Test-Path -LiteralPath (Join-Path $script:SrcPath $name) | Should -BeTrue -Because "the entry script imports $name"
+        }
+    }
+}

@@ -626,6 +626,11 @@ function Show-PimMainForm {
         [string] $LogDirectory,
 
         [Parameter()]
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $CloudName,
+
+        [Parameter()]
         [switch] $NoShow
     )
 
@@ -680,7 +685,16 @@ function Show-PimMainForm {
         $null = $comboCloud.Items.Add($cloud.DisplayName)
     }
     $comboCloud.SelectedIndex = 0
-    $ui.Cloud = $availableClouds[0]
+    if (-not [string]::IsNullOrWhiteSpace($CloudName)) {
+        for ($i = 0; $i -lt $availableClouds.Count; $i++) {
+            $candidate = $availableClouds[$i]
+            if ($candidate.DisplayName -eq $CloudName -or $candidate.AzEnvironment -eq $CloudName) {
+                $comboCloud.SelectedIndex = $i
+                break
+            }
+        }
+    }
+    $ui.Cloud = $availableClouds[$comboCloud.SelectedIndex]
 
     $checkDeviceCode = New-Object System.Windows.Forms.CheckBox
     $checkDeviceCode.Name = 'checkDeviceCode'
