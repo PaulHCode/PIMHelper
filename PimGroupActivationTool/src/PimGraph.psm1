@@ -985,6 +985,49 @@ function Resolve-PimGroup {
     return $result
 }
 
+function Get-PimAvailableCloudConfiguration {
+    <#
+    .SYNOPSIS
+        Returns the built-in clouds plus any custom Az environment registered locally.
+
+    .DESCRIPTION
+        Enumerating Get-AzEnvironment and Get-MgEnvironment lets the UI offer the "Custom"
+        clouds from the spec without hard-coding endpoints. Environments whose Graph
+        endpoint cannot be resolved are still returned so the UI can explain why they are
+        unusable, unless -SupportedOnly is specified.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter()]
+        [switch] $SupportedOnly
+    )
+
+    $azEnvironments = @()
+    try {
+        $azEnvironments = @(Invoke-PimExternalCommand -Name 'Get-AzEnvironment' -Parameters @{ ErrorAction = 'Stop' })
+    }
+    catch {
+        Write-PimLog -Level Debug -Operation 'Get-Clouds' -Message "Could not enumerate Az environments: $($_.Exception.Message)"
+    }
+
+    $graphEnvironments = @()
+    try {
+        $graphEnvironments = @(Invoke-PimExternalCommand -Name 'Get-MgEnvironment' -Parameters @{ ErrorAction = 'Stop' })
+    }
+    catch {
+        Write-PimLog -Level Debug -Operation 'Get-Clouds' -Message "Could not enumerate Microsoft Graph environments: $($_.Exception.Message)"
+    }
+
+    $all = @(Get-PimCloudConfiguration -AzEnvironment $azEnvironments -GraphEnvironment $graphEnvironments)
+
+    if ($SupportedOnly) {
+        $all = @($all | Where-Object { $_.IsSupported })
+    }
+
+    return , ([object[]]$all)
+}
+
 function Get-PimEligibleGroups {
     <#
     .SYNOPSIS
@@ -1307,6 +1350,7 @@ Export-ModuleMember -Function @(
     'Get-CurrentGraphUser'
     'Clear-PimGroupCache'
     'Resolve-PimGroup'
+    'Get-PimAvailableCloudConfiguration'
     'Get-PimEligibleGroups'
     'Request-PimGroupActivation'
     'Get-PimActiveGroupAssignment'
