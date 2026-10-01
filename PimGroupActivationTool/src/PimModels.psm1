@@ -1092,6 +1092,173 @@ function Get-PimSubmissionReadiness {
     }
 }
 
+function Get-PimUiState {
+    <#
+    .SYNOPSIS
+        Returns the list of valid UI states, in lifecycle order.
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param()
+
+    return , ([string[]]@(
+        'SignedOut'
+        'DiscoveringTenants'
+        'TenantsReady'
+        'LoadingGroups'
+        'GroupsReady'
+        'Submitting'
+        'Completed'
+    ))
+}
+
+function Test-PimUiStateTransition {
+    <#
+    .SYNOPSIS
+        Returns $true when moving from one UI state to another is allowed.
+
+    .DESCRIPTION
+        The spec defines an explicit state machine so control enablement is never driven
+        from unrelated event handlers. Keeping the transition table here makes it testable
+        without a message loop.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('SignedOut', 'DiscoveringTenants', 'TenantsReady', 'LoadingGroups', 'GroupsReady', 'Submitting', 'Completed')]
+        [string] $From,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('SignedOut', 'DiscoveringTenants', 'TenantsReady', 'LoadingGroups', 'GroupsReady', 'Submitting', 'Completed')]
+        [string] $To
+    )
+
+    $allowed = @{
+        'SignedOut'          = @('DiscoveringTenants')
+        'DiscoveringTenants' = @('TenantsReady', 'SignedOut')
+        'TenantsReady'       = @('LoadingGroups', 'DiscoveringTenants', 'SignedOut')
+        'LoadingGroups'      = @('GroupsReady', 'TenantsReady', 'SignedOut')
+        'GroupsReady'        = @('Submitting', 'LoadingGroups', 'TenantsReady', 'SignedOut')
+        'Submitting'         = @('Completed', 'GroupsReady', 'SignedOut')
+        'Completed'          = @('Submitting', 'LoadingGroups', 'TenantsReady', 'SignedOut')
+    }
+
+    return ($To -in $allowed[$From])
+}
+
+function Get-PimUiControlState {
+    <#
+    .SYNOPSIS
+        Maps a UI state plus the current selection to per-control enablement.
+
+    .DESCRIPTION
+        PimUi calls this and applies the result; no other code decides whether a button is
+        enabled. That keeps the enablement rules unit-testable without WinForms.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('SignedOut', 'DiscoveringTenants', 'TenantsReady', 'LoadingGroups', 'GroupsReady', 'Submitting', 'Completed')]
+        [string] $State,
+
+        [Parameter()]
+        [int] $SelectedTenantCount = 0,
+
+        [Parameter()]
+        [int] $SelectedGroupCount = 0,
+
+        [Parameter()]
+        [int] $ResultCount = 0,
+
+        [Parameter()]
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $Justification,
+
+        [Parameter()]
+        [AllowNull()]
+        [Nullable[timespan]] $Duration
+    )
+
+    $isBusy = $State -in @('DiscoveringTenants', 'LoadingGroups', 'Submitting')
+    $isIdle = -not $isBusy
+
+    # Tenants exist from TenantsReady onwards; groups exist from GroupsReady onwards.
+    $hasTenants = $State -in @('TenantsReady', 'LoadingGroups', 'GroupsReady', 'Submitting', 'Completed')
+    $hasGroups  = $State -in @('GroupsReady', 'Submitting', 'Completed')
+
+    $readiness = Get-PimSubmissionReadiness `
+        -SelectedGroupCount $SelectedGroupCount `
+        -Justification $Justification `
+        -Duration $Duration `
+        -IsBusy $isBusy
+
+    $canSubmit = $readiness.CanSubmit -and ($State -in @('GroupsReady', 'Completed'))
+
+    $submitBlockedReasons = @()
+    if (-not $canSubmit) {
+        if ($State -in @('GroupsReady', 'Completed')) {
+            $submitBlockedReasons = $readiness.Reasons
+        }
+        elseif ($isBusy) {
+            $submitBlockedReasons = @('An operation is already running.')
+        }
+        else {
+            $submitBlockedReasons = @('Load eligible groups first.')
+        }
+    }
+
+    [pscustomobject]@{
+        State                = $State
+        IsBusy               = $isBusy
+        CloudSelectionEnabled = ($State -eq 'SignedOut')
+        SignInEnabled        = ($State -eq 'SignedOut')
+        SwitchAccountEnabled = ($isIdle -and $hasTenants)
+        TenantGridEnabled    = ($isIdle -and $hasTenants)
+        LoadGroupsEnabled    = ($isIdle -and $hasTenants -and $SelectedTenantCount -gt 0)
+        GroupGridEnabled     = ($isIdle -and $hasGroups)
+        RequestSettingsEnabled = ($isIdle -and $hasGroups)
+        SubmitEnabled        = $canSubmit
+        CancelEnabled        = $isBusy
+        ExportEnabled        = ($isIdle -and $ResultCount -gt 0)
+        ProgressVisible      = $isBusy
+        SubmitBlockedReasons = [string[]]$submitBlockedReasons
+    }
+}
+
+function Get-PimResetScope {
+    <#
+    .SYNOPSIS
+        Returns which grids must be cleared when the user changes something upstream.
+
+    .DESCRIPTION
+        The spec requires that changing the cloud or account clears tenants, groups, and
+        results, and that changing the tenant selection clears groups and results. Group
+        selections are never retained across those changes.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('Cloud', 'Account', 'TenantSelection', 'GroupReload')]
+        [string] $Change
+    )
+
+    $clearTenants = $Change -in @('Cloud', 'Account')
+    $clearGroups  = $true
+    $clearResults = $true
+
+    [pscustomobject]@{
+        Change       = $Change
+        ClearTenants = $clearTenants
+        ClearGroups  = $clearGroups
+        ClearResults = $clearResults
+        ResetState   = $(if ($clearTenants) { 'SignedOut' } else { 'TenantsReady' })
+    }
+}
+
 Export-ModuleMember -Function @(
     'Get-PimBuiltInCloudConfiguration'
     'Get-PimCloudConfiguration'
@@ -1114,4 +1281,8 @@ Export-ModuleMember -Function @(
     'ConvertTo-PimExceptionText'
     'Test-PimJustification'
     'Get-PimSubmissionReadiness'
+    'Get-PimUiState'
+    'Test-PimUiStateTransition'
+    'Get-PimUiControlState'
+    'Get-PimResetScope'
 )

@@ -666,3 +666,184 @@ Describe 'Format-PimBaseUri' {
         Format-PimBaseUri -Uri '' | Should -BeNullOrEmpty
     }
 }
+
+Describe 'Get-PimUiState' {
+    It 'returns the seven lifecycle states in order' {
+        $states = Get-PimUiState
+        $states.Count | Should -Be 7
+        $states[0]    | Should -Be 'SignedOut'
+        $states[-1]   | Should -Be 'Completed'
+    }
+
+    It 'returns an array even though it is built inline' {
+        ((Get-PimUiState) -is [array]) | Should -BeTrue
+    }
+}
+
+Describe 'Test-PimUiStateTransition' {
+    It 'allows the documented happy path' -ForEach @(
+        @{ From = 'SignedOut';          To = 'DiscoveringTenants' }
+        @{ From = 'DiscoveringTenants'; To = 'TenantsReady' }
+        @{ From = 'TenantsReady';       To = 'LoadingGroups' }
+        @{ From = 'LoadingGroups';      To = 'GroupsReady' }
+        @{ From = 'GroupsReady';        To = 'Submitting' }
+        @{ From = 'Submitting';         To = 'Completed' }
+        @{ From = 'Completed';          To = 'Submitting' }
+    ) {
+        Test-PimUiStateTransition -From $From -To $To | Should -BeTrue
+    }
+
+    It 'allows the documented failure paths' -ForEach @(
+        @{ From = 'DiscoveringTenants'; To = 'SignedOut' }
+        @{ From = 'LoadingGroups';      To = 'TenantsReady' }
+        @{ From = 'Submitting';         To = 'GroupsReady' }
+    ) {
+        Test-PimUiStateTransition -From $From -To $To | Should -BeTrue
+    }
+
+    It 'rejects skipping sign-in' {
+        Test-PimUiStateTransition -From 'SignedOut' -To 'GroupsReady' | Should -BeFalse
+        Test-PimUiStateTransition -From 'SignedOut' -To 'Submitting'  | Should -BeFalse
+    }
+
+    It 'rejects submitting before groups are loaded' {
+        Test-PimUiStateTransition -From 'TenantsReady' -To 'Submitting' | Should -BeFalse
+    }
+
+    It 'always allows returning to SignedOut from a settled state' -ForEach @(
+        @{ From = 'TenantsReady' }
+        @{ From = 'GroupsReady' }
+        @{ From = 'Completed' }
+    ) {
+        Test-PimUiStateTransition -From $From -To 'SignedOut' | Should -BeTrue
+    }
+
+    It 'rejects an unknown state' {
+        { Test-PimUiStateTransition -From 'NotAState' -To 'SignedOut' } | Should -Throw
+    }
+}
+
+Describe 'Get-PimUiControlState' {
+    It 'only allows cloud selection and sign-in when signed out' {
+        $s = Get-PimUiControlState -State 'SignedOut'
+
+        $s.CloudSelectionEnabled  | Should -BeTrue
+        $s.SignInEnabled          | Should -BeTrue
+        $s.TenantGridEnabled      | Should -BeFalse
+        $s.LoadGroupsEnabled      | Should -BeFalse
+        $s.GroupGridEnabled       | Should -BeFalse
+        $s.RequestSettingsEnabled | Should -BeFalse
+        $s.SubmitEnabled          | Should -BeFalse
+        $s.CancelEnabled          | Should -BeFalse
+        $s.IsBusy                 | Should -BeFalse
+    }
+
+    It 'allows only cancel while discovering tenants' {
+        $s = Get-PimUiControlState -State 'DiscoveringTenants'
+
+        $s.IsBusy            | Should -BeTrue
+        $s.ProgressVisible   | Should -BeTrue
+        $s.CancelEnabled     | Should -BeTrue
+        $s.SignInEnabled     | Should -BeFalse
+        $s.CloudSelectionEnabled | Should -BeFalse
+        $s.TenantGridEnabled | Should -BeFalse
+        $s.LoadGroupsEnabled | Should -BeFalse
+    }
+
+    It 'allows only cancel while loading groups' {
+        $s = Get-PimUiControlState -State 'LoadingGroups' -SelectedTenantCount 2
+
+        $s.IsBusy            | Should -BeTrue
+        $s.CancelEnabled     | Should -BeTrue
+        $s.LoadGroupsEnabled | Should -BeFalse
+        $s.TenantGridEnabled | Should -BeFalse
+    }
+
+    It 'keeps Load Eligible Groups disabled until a tenant is selected' {
+        (Get-PimUiControlState -State 'TenantsReady' -SelectedTenantCount 0).LoadGroupsEnabled | Should -BeFalse
+        (Get-PimUiControlState -State 'TenantsReady' -SelectedTenantCount 1).LoadGroupsEnabled | Should -BeTrue
+    }
+
+    It 'enables switching accounts once tenants are known' {
+        (Get-PimUiControlState -State 'SignedOut').SwitchAccountEnabled    | Should -BeFalse
+        (Get-PimUiControlState -State 'TenantsReady').SwitchAccountEnabled | Should -BeTrue
+        (Get-PimUiControlState -State 'Completed').SwitchAccountEnabled    | Should -BeTrue
+    }
+
+    It 'requires a selected group, justification, and duration before submit is enabled' {
+        $readyArgs = @{ State = 'GroupsReady'; SelectedGroupCount = 1; Justification = 'Approved change CHG123'; Duration = [timespan]::FromHours(2) }
+        (Get-PimUiControlState @readyArgs).SubmitEnabled | Should -BeTrue
+
+        (Get-PimUiControlState -State 'GroupsReady' -SelectedGroupCount 0 -Justification 'Approved change CHG123' -Duration ([timespan]::FromHours(2))).SubmitEnabled | Should -BeFalse
+        (Get-PimUiControlState -State 'GroupsReady' -SelectedGroupCount 1 -Justification '   ' -Duration ([timespan]::FromHours(2))).SubmitEnabled | Should -BeFalse
+        (Get-PimUiControlState -State 'GroupsReady' -SelectedGroupCount 1 -Justification 'Approved change CHG123' -Duration $null).SubmitEnabled | Should -BeFalse
+    }
+
+    It 'explains why submit is blocked' {
+        $s = Get-PimUiControlState -State 'GroupsReady' -SelectedGroupCount 0 -Justification '' -Duration $null
+        $s.SubmitBlockedReasons | Should -Contain 'Select at least one group.'
+        $s.SubmitBlockedReasons | Should -Contain 'Enter a justification.'
+        $s.SubmitBlockedReasons | Should -Contain 'Choose a duration.'
+    }
+
+    It 'tells the user to load groups first when none are loaded' {
+        $s = Get-PimUiControlState -State 'TenantsReady' -SelectedTenantCount 1
+        $s.SubmitBlockedReasons | Should -Contain 'Load eligible groups first.'
+    }
+
+    It 'never enables submit while an operation is running' {
+        $s = Get-PimUiControlState -State 'Submitting' -SelectedGroupCount 3 -Justification 'Approved change CHG123' -Duration ([timespan]::FromHours(1))
+        $s.SubmitEnabled | Should -BeFalse
+        $s.CancelEnabled | Should -BeTrue
+        $s.SubmitBlockedReasons | Should -Contain 'An operation is already running.'
+    }
+
+    It 'allows resubmitting from Completed' {
+        $s = Get-PimUiControlState -State 'Completed' -SelectedGroupCount 1 -Justification 'Approved change CHG123' -Duration ([timespan]::FromHours(1)) -ResultCount 1
+        $s.SubmitEnabled | Should -BeTrue
+        $s.ExportEnabled | Should -BeTrue
+    }
+
+    It 'only enables export when there are results and nothing is running' {
+        (Get-PimUiControlState -State 'Completed' -ResultCount 0).ExportEnabled  | Should -BeFalse
+        (Get-PimUiControlState -State 'Completed' -ResultCount 5).ExportEnabled  | Should -BeTrue
+        (Get-PimUiControlState -State 'Submitting' -ResultCount 5).ExportEnabled | Should -BeFalse
+    }
+
+    It 'rejects an unknown state' {
+        { Get-PimUiControlState -State 'Bogus' } | Should -Throw
+    }
+}
+
+Describe 'Get-PimResetScope' {
+    It 'clears everything when the cloud changes' {
+        $r = Get-PimResetScope -Change 'Cloud'
+        $r.ClearTenants | Should -BeTrue
+        $r.ClearGroups  | Should -BeTrue
+        $r.ClearResults | Should -BeTrue
+        $r.ResetState   | Should -Be 'SignedOut'
+    }
+
+    It 'clears everything when the account changes' {
+        $r = Get-PimResetScope -Change 'Account'
+        $r.ClearTenants | Should -BeTrue
+        $r.ResetState   | Should -Be 'SignedOut'
+    }
+
+    It 'keeps tenants but clears groups and results when the tenant selection changes' {
+        $r = Get-PimResetScope -Change 'TenantSelection'
+        $r.ClearTenants | Should -BeFalse
+        $r.ClearGroups  | Should -BeTrue
+        $r.ClearResults | Should -BeTrue
+        $r.ResetState   | Should -Be 'TenantsReady'
+    }
+
+    It 'never retains group selections' -ForEach @(
+        @{ Change = 'Cloud' }
+        @{ Change = 'Account' }
+        @{ Change = 'TenantSelection' }
+        @{ Change = 'GroupReload' }
+    ) {
+        (Get-PimResetScope -Change $Change).ClearGroups | Should -BeTrue
+    }
+}
