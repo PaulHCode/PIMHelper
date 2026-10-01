@@ -300,6 +300,25 @@ Describe 'Export-PimResultCsv' {
         Export-PimResultCsv -Result $script:SampleResults -Path $script:CsvPath -WhatIf
         Test-Path -LiteralPath $script:CsvPath | Should -BeFalse
     }
+
+    It 'neutralizes a formula-bearing group name from a foreign tenant' {
+        # A guest tenant's administrator controls the group display name, so it must not
+        # reach Excel as a live formula.
+        $hostile = @(
+            New-PimActivationResultRecord -TenantId '11111111-1111-1111-1111-111111111111' `
+                -TenantDisplayName "=HYPERLINK(`"https://attacker.example`",`"Click`")" `
+                -GroupId '22222222-2222-2222-2222-222222222222' `
+                -GroupDisplayName "=cmd|'/c calc'!A1" `
+                -AccessId 'member' -Status 'Success' -Message '@SUM(A1:A9)'
+        )
+
+        Export-PimResultCsv -Result $hostile -Path $script:CsvPath
+
+        $row = @(Import-Csv -LiteralPath $script:CsvPath)[0]
+        $row.GroupDisplayName[0]  | Should -Be "'"
+        $row.TenantDisplayName[0] | Should -Be "'"
+        $row.Message[0]           | Should -Be "'"
+    }
 }
 
 } # Describe 'PimUi'

@@ -288,7 +288,7 @@ Describe 'Test-PimGraphContext' {
         $script:GoodContext = [pscustomobject]@{
             TenantId    = '11111111-1111-1111-1111-111111111111'
             Environment = 'Global'
-            Scopes      = @('PrivilegedEligibilitySchedule.Read.AzureADGroup', 'PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup')
+            Scopes      = @('PrivilegedEligibilitySchedule.Read.AzureADGroup', 'PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup', 'User.Read')
         }
     }
 
@@ -364,7 +364,8 @@ Describe 'Connect-PimGraphTenant' {
         $script:Attempts = @()
         Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p)
             $script:Attempts += , @($p['Scopes'])
-            if (@($p['Scopes']).Count -gt 2) { throw 'AADSTS65001: The user or administrator has not consented to use the application.' }
+            # Group.Read.All is the only scope in the full set but not the minimum set.
+            if (@($p['Scopes']) -contains 'Group.Read.All') { throw 'AADSTS65001: The user or administrator has not consented to use the application.' }
         }
         Set-PimCommandOverride -Name 'Get-MgContext' -Handler { param($p)
             [pscustomobject]@{ TenantId = '11111111-1111-1111-1111-111111111111'; Environment = 'Global'; Scopes = (Get-PimMinimumGraphScope) }
@@ -471,6 +472,16 @@ Describe 'Invoke-PimGraphRequest' {
         { Invoke-PimGraphRequest -Uri '/v1.0/me' } | Should -Throw '*GraphBaseUri is required*'
     }
 
+    It 'refuses to send a bearer-authenticated request over plain http' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p) @{ requestedUri = $p['Uri'] } }
+        { Invoke-PimGraphRequest -Uri 'http://graph.contoso.example/v1.0/me' } | Should -Throw '*must use https*'
+    }
+
+    It 'refuses a base URI that is not https' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p) @{ requestedUri = $p['Uri'] } }
+        { Invoke-PimGraphRequest -Uri '/v1.0/me' -GraphBaseUri 'http://graph.contoso.example' } | Should -Throw '*must use https*'
+    }
+
     It 'serializes a hashtable body to JSON' {
         Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p) @{ body = $p['Body']; contentType = $p['ContentType'] } }
         $result = Invoke-PimGraphRequest -Uri 'https://graph.microsoft.com/v1.0/x' -Method POST -Body @{ action = 'selfActivate' }
@@ -521,6 +532,45 @@ Describe 'Invoke-PimGraphRequest' {
 
         { Invoke-PimGraphRequest -Uri 'https://graph.microsoft.com/v1.0/x' -InitialRetryDelaySeconds 0 } | Should -Throw
         $script:Attempt | Should -Be 1
+    }
+
+    It 'does not retry a POST that failed with a server error' {
+        # The request may already have been accepted, so repeating it risks a duplicate activation.
+        $script:Attempt = 0
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            $script:Attempt++
+            throw 'Request failed with status 503 ServiceUnavailable'
+        }
+
+        { Invoke-PimGraphRequest -Uri 'https://graph.microsoft.com/v1.0/x' -Method POST -Body @{ a = 1 } -MaximumRetryCount 3 -InitialRetryDelaySeconds 0 } | Should -Throw
+        $script:Attempt | Should -Be 1
+    }
+
+    It 'still retries a throttled POST' {
+        # A throttled request was rejected before processing, so it is safe to repeat.
+        $script:Attempt = 0
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            $script:Attempt++
+            if ($script:Attempt -lt 3) { throw 'Request failed with status 429 TooManyRequests Retry-After: 0' }
+            @{ id = 'ok' }
+        }
+
+        $result = Invoke-PimGraphRequest -Uri 'https://graph.microsoft.com/v1.0/x' -Method POST -Body @{ a = 1 } -MaximumRetryCount 3 -InitialRetryDelaySeconds 0
+        $result.id      | Should -Be 'ok'
+        $script:Attempt | Should -Be 3
+    }
+
+    It 'still retries a GET that failed with a server error' {
+        $script:Attempt = 0
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            $script:Attempt++
+            if ($script:Attempt -lt 2) { throw 'Request failed with status 503 ServiceUnavailable' }
+            @{ id = 'ok' }
+        }
+
+        $result = Invoke-PimGraphRequest -Uri 'https://graph.microsoft.com/v1.0/x' -Method GET -MaximumRetryCount 3 -InitialRetryDelaySeconds 0
+        $result.id      | Should -Be 'ok'
+        $script:Attempt | Should -Be 2
     }
 }
 
@@ -577,12 +627,23 @@ Describe 'Get-PimGraphCollection' {
         $items.Count | Should -Be 0
     }
 
-    It 'stops at the page limit to avoid an infinite loop' {
+    It 'throws rather than returning a truncated collection at the page limit' {
+        $script:PageNumber = 0
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            $script:PageNumber++
+            @{ value = @(@{ id = $script:PageNumber }); '@odata.nextLink' = "https://graph.microsoft.com/page$($script:PageNumber + 1)" }
+        }
+        { Get-PimGraphCollection -Uri 'https://graph.microsoft.com/page1' -MaximumPageCount 5 } |
+            Should -Throw -ExpectedMessage '*incomplete*'
+        $script:PageNumber | Should -Be 5
+    }
+
+    It 'throws when Graph returns a repeating next link' {
         Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
             @{ value = @(@{ id = 1 }); '@odata.nextLink' = 'https://graph.microsoft.com/forever' }
         }
-        $items = Get-PimGraphCollection -Uri 'https://graph.microsoft.com/forever' -MaximumPageCount 5
-        $items.Count | Should -Be 5
+        { Get-PimGraphCollection -Uri 'https://graph.microsoft.com/forever' -MaximumPageCount 50 } |
+            Should -Throw -ExpectedMessage '*repeating page link*'
     }
 }
 
@@ -658,6 +719,31 @@ Describe 'Resolve-PimGroup' {
         Resolve-PimGroup -GroupId $script:GroupId -GraphBaseUri 'https://graph.microsoft.com' -TenantId 'tenant-b' | Out-Null
         $script:Calls | Should -Be 2
     }
+
+    It 'rejects a group ID that is not a GUID before interpolating it into a URI' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p) throw 'should not be called' }
+        { Resolve-PimGroup -GroupId "../../me`$select=id" -GraphBaseUri 'https://graph.microsoft.com' -TenantId $script:TenantId } |
+            Should -Throw '*GroupId must be a GUID*'
+    }
+}
+
+Describe 'Disconnect-PimAzureAccount' {
+    It 'clears the group name cache so a name resolved under another account cannot persist' {
+        $script:Calls = 0
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            $script:Calls++
+            @{ id = $script:GroupId; displayName = "Group $($script:Calls)" }
+        }
+        Set-PimCommandOverride -Name 'Disconnect-AzAccount' -Handler { param($p) $null }
+        Set-PimCommandOverride -Name 'Clear-AzContext'      -Handler { param($p) $null }
+
+        (Resolve-PimGroup -GroupId $script:GroupId -GraphBaseUri 'https://graph.microsoft.com' -TenantId $script:TenantId).DisplayName | Should -Be 'Group 1'
+
+        Disconnect-PimAzureAccount
+
+        (Resolve-PimGroup -GroupId $script:GroupId -GraphBaseUri 'https://graph.microsoft.com' -TenantId $script:TenantId).DisplayName | Should -Be 'Group 2'
+        $script:Calls | Should -Be 2
+    }
 }
 
 Describe 'Get-PimEligibleGroups' {
@@ -680,8 +766,13 @@ Describe 'Get-PimEligibleGroups' {
         }
     }
 
-    It 'uses filterByCurrentUser first' {
-        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+    It 'rejects a principal ID that is not a GUID before interpolating it into an OData filter' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p) throw 'should not be called' }
+        { Get-PimEligibleGroups -TenantId $script:TenantId -PrincipalId "x' or startswith(principalId,'" -GraphBaseUri 'https://graph.microsoft.com' } |
+            Should -Throw '*PrincipalId must be a GUID*'
+    }
+
+    It 'uses filterByCurrentUser first' {        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
             $script:RequestedUris += $p['Uri']
             if ($p['Uri'] -like '*filterByCurrentUser*') { return $script:EligibilityResponse }
             return @{ id = $script:GroupId; displayName = 'PIM Test Group' }
@@ -930,9 +1021,15 @@ Describe 'Get-PimActiveGroupAssignment' {
         $active[0].AssignmentType | Should -Be 'activated'
     }
 
-    It 'returns an empty array instead of failing when the query is not permitted' {
+    It 'throws by default when the query is not permitted' {
         Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p) throw '{"error":{"code":"Authorization_RequestDenied"}}' }
-        $active = Get-PimActiveGroupAssignment -GraphBaseUri 'https://graph.microsoft.com'
+        { Get-PimActiveGroupAssignment -GraphBaseUri 'https://graph.microsoft.com' } |
+            Should -Throw -ExpectedMessage '*active assignments*'
+    }
+
+    It 'returns an empty array when the caller opts out of failures' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p) throw '{"error":{"code":"Authorization_RequestDenied"}}' }
+        $active = Get-PimActiveGroupAssignment -GraphBaseUri 'https://graph.microsoft.com' -IgnoreFailure
         $active.Count | Should -Be 0
     }
 }

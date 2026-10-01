@@ -194,10 +194,20 @@ $script:SignInWorker = {
     Import-Module $Paths.Logging -Force -DisableNameChecking
     Import-Module $Paths.Graph   -Force -DisableNameChecking
 
-    if ($Paths.LogDirectory) { Initialize-PimLog -Path $Paths.LogDirectory | Out-Null } else { Initialize-PimLog | Out-Null }
+    if (-not $Paths.LoggingEnabled) { Initialize-PimLog -Disable | Out-Null }
+    elseif ($Paths.LogDirectory)    { Initialize-PimLog -Path $Paths.LogDirectory | Out-Null }
+    else                            { Initialize-PimLog | Out-Null }
 
     $Shared.Status = 'Signing in to Azure...'
     Write-Information "Signing in to $($CloudConfiguration.DisplayName)..."
+
+    if ($ForceNewAccount) {
+        # Clear both contexts, otherwise the Graph session can stay bound to the
+        # previous account while the UI shows the new one.
+        Write-Information 'Clearing the existing Azure and Microsoft Graph sessions...'
+        Disconnect-PimAzureAccount
+        Disconnect-PimGraph
+    }
 
     $connectParams = @{ CloudConfiguration = $CloudConfiguration }
     if ($ForceNewAccount) { $connectParams['Force'] = $true }
@@ -224,6 +234,7 @@ $script:LoadGroupsWorker = {
         [hashtable] $Paths,
         [object]    $CloudConfiguration,
         [object[]]  $Tenants,
+        [bool]      $UseDeviceCode,
         [hashtable] $Shared
     )
 
@@ -235,7 +246,9 @@ $script:LoadGroupsWorker = {
     Import-Module $Paths.Logging -Force -DisableNameChecking
     Import-Module $Paths.Graph   -Force -DisableNameChecking
 
-    if ($Paths.LogDirectory) { Initialize-PimLog -Path $Paths.LogDirectory | Out-Null } else { Initialize-PimLog | Out-Null }
+    if (-not $Paths.LoggingEnabled) { Initialize-PimLog -Disable | Out-Null }
+    elseif ($Paths.LogDirectory)    { Initialize-PimLog -Path $Paths.LogDirectory | Out-Null }
+    else                            { Initialize-PimLog | Out-Null }
 
     $groups = New-Object System.Collections.Generic.List[object]
     $tenantStatus = New-Object System.Collections.Generic.List[object]
@@ -255,7 +268,7 @@ $script:LoadGroupsWorker = {
         $Shared.Status = "Connecting to $($tenant.TenantDisplayName) ($index of $($Tenants.Count))..."
         Write-Information "Connecting to $($tenant.TenantDisplayName) [$($tenant.TenantId)]..."
 
-        $connection = Connect-PimGraphTenant -TenantId $tenant.TenantId -CloudConfiguration $CloudConfiguration
+        $connection = Connect-PimGraphTenant -TenantId $tenant.TenantId -CloudConfiguration $CloudConfiguration -UseDeviceAuthentication:([bool]$UseDeviceCode)
 
         if (-not $connection.Success) {
             Write-Warning "$($tenant.TenantDisplayName): $($connection.Message)"
@@ -276,9 +289,13 @@ $script:LoadGroupsWorker = {
         try {
             $Shared.Status = "Reading eligible groups in $($tenant.TenantDisplayName)..."
 
+            # The connection result carries no principal ID; resolve it per tenant,
+            # because the guest object ID differs in every directory.
+            $me = Get-CurrentGraphUser -GraphBaseUri $CloudConfiguration.GraphBaseUri
+
             $eligible = Get-PimEligibleGroups `
                 -TenantId $tenant.TenantId `
-                -PrincipalId $connection.PrincipalId `
+                -PrincipalId $me.Id `
                 -GraphBaseUri $CloudConfiguration.GraphBaseUri `
                 -TenantDisplayName $tenant.TenantDisplayName `
                 -SkipGroupNameResolution:(-not $connection.HasGroupRead)
@@ -330,6 +347,7 @@ $script:SubmitWorker = {
         [bool]      $StopOnFirstFailure,
         [string]    $TicketNumber,
         [string]    $TicketSystem,
+        [bool]      $UseDeviceCode,
         [hashtable] $Shared
     )
 
@@ -341,7 +359,9 @@ $script:SubmitWorker = {
     Import-Module $Paths.Logging -Force -DisableNameChecking
     Import-Module $Paths.Graph   -Force -DisableNameChecking
 
-    if ($Paths.LogDirectory) { Initialize-PimLog -Path $Paths.LogDirectory | Out-Null } else { Initialize-PimLog | Out-Null }
+    if (-not $Paths.LoggingEnabled) { Initialize-PimLog -Disable | Out-Null }
+    elseif ($Paths.LogDirectory)    { Initialize-PimLog -Path $Paths.LogDirectory | Out-Null }
+    else                            { Initialize-PimLog | Out-Null }
 
     $results = New-Object System.Collections.Generic.List[object]
     $Shared.Total = $Groups.Count
@@ -359,7 +379,7 @@ $script:SubmitWorker = {
         $Shared.Status = "Connecting to $tenantName..."
         Write-Information "Connecting to $tenantName [$tenantId]..."
 
-        $connection = Connect-PimGraphTenant -TenantId $tenantId -CloudConfiguration $CloudConfiguration
+        $connection = Connect-PimGraphTenant -TenantId $tenantId -CloudConfiguration $CloudConfiguration -UseDeviceAuthentication:([bool]$UseDeviceCode)
 
         if (-not $connection.Success) {
             Write-Warning "$tenantName`: $($connection.Message)"
@@ -589,17 +609,19 @@ function Export-PimResultCsv {
     if (-not $PSCmdlet.ShouldProcess($Path, 'Write activation results')) { return }
 
     $rows = foreach ($item in $Result) {
+        # Display names come from foreign tenants, so every text cell is neutralized
+        # against spreadsheet formula injection before it reaches the file.
         [pscustomobject]@{
-            TenantDisplayName = $item.TenantDisplayName
-            TenantId          = $item.TenantId
-            GroupDisplayName  = $item.GroupDisplayName
-            GroupId           = $item.GroupId
-            AccessId          = $item.AccessId
-            Status            = $item.Status
-            Message           = $item.Message
-            RequestId         = $item.RequestId
+            TenantDisplayName = ConvertTo-PimSafeCsvValue -Value $item.TenantDisplayName
+            TenantId          = ConvertTo-PimSafeCsvValue -Value $item.TenantId
+            GroupDisplayName  = ConvertTo-PimSafeCsvValue -Value $item.GroupDisplayName
+            GroupId           = ConvertTo-PimSafeCsvValue -Value $item.GroupId
+            AccessId          = ConvertTo-PimSafeCsvValue -Value $item.AccessId
+            Status            = ConvertTo-PimSafeCsvValue -Value $item.Status
+            Message           = ConvertTo-PimSafeCsvValue -Value $item.Message
+            RequestId         = ConvertTo-PimSafeCsvValue -Value $item.RequestId
             SubmittedAt       = (Get-PimPropertyValue -InputObject $item -Name 'Timestamp')
-            Detail            = (Get-PimPropertyValue -InputObject $item -Name 'Detail')
+            Detail            = ConvertTo-PimSafeCsvValue -Value (Get-PimPropertyValue -InputObject $item -Name 'Detail')
         }
     }
 
@@ -636,11 +658,16 @@ function Show-PimMainForm {
 
     [System.Windows.Forms.Application]::EnableVisualStyles()
 
+    # Workers run in fresh runspaces, so the host's logging choice has to travel with
+    # them or -NoLog and a custom -LogPath would be silently ignored.
+    $hostLogState = Get-PimLogState
+
     $paths = @{
-        Models       = (Join-Path -Path $script:ModuleRoot -ChildPath 'PimModels.psm1')
-        Logging      = (Join-Path -Path $script:ModuleRoot -ChildPath 'PimLogging.psm1')
-        Graph        = (Join-Path -Path $script:ModuleRoot -ChildPath 'PimGraph.psm1')
-        LogDirectory = $LogDirectory
+        Models         = (Join-Path -Path $script:ModuleRoot -ChildPath 'PimModels.psm1')
+        Logging        = (Join-Path -Path $script:ModuleRoot -ChildPath 'PimLogging.psm1')
+        Graph          = (Join-Path -Path $script:ModuleRoot -ChildPath 'PimGraph.psm1')
+        LogDirectory   = if ([string]::IsNullOrWhiteSpace($LogDirectory)) { $hostLogState.Directory } else { $LogDirectory }
+        LoggingEnabled = [bool]$hostLogState.Enabled
     }
 
     # ---- Mutable UI state -------------------------------------------------------
@@ -1281,6 +1308,7 @@ function Show-PimMainForm {
             Paths              = $paths
             CloudConfiguration = $ui.Cloud
             Tenants            = $selectedTenants
+            UseDeviceCode      = [bool]$checkDeviceCode.Checked
         } 'LoadingGroups'
     })
 
@@ -1314,6 +1342,7 @@ function Show-PimMainForm {
             StopOnFirstFailure = [bool]$checkStopOnFailure.Checked
             TicketNumber       = $textTicketNumber.Text
             TicketSystem       = $textTicketSystem.Text
+            UseDeviceCode      = [bool]$checkDeviceCode.Checked
         } 'Submitting'
     })
 
@@ -1382,19 +1411,30 @@ function Show-PimMainForm {
 
     $form.Add_FormClosing({
         param($sender, $eventArgs)
-        if ($null -ne $ui.Operation) {
+
+        # The confirmation dialog runs a nested message loop, which would let the timer
+        # tick and clear $ui.Operation underneath us. Stop the timer and take a local
+        # reference before prompting.
+        $timer.Stop()
+        $operation = $ui.Operation
+
+        if ($null -ne $operation) {
             $answer = [System.Windows.Forms.MessageBox]::Show($form, 'An operation is still running. Close anyway?', 'Operation in progress', 'YesNo', 'Warning')
             if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) {
                 $eventArgs.Cancel = $true
+                $timer.Start()
                 return
             }
-            $ui.Operation.Shared.CancelRequested = $true
-            try { $ui.Operation.PowerShell.Stop() } catch { Write-Debug "Stopping the worker failed: $($_.Exception.Message)" }
-            try { $ui.Operation.PowerShell.Dispose() } catch { Write-Debug "Disposing the worker failed: $($_.Exception.Message)" }
-            try { $ui.Operation.Runspace.Dispose() } catch { Write-Debug "Disposing the runspace failed: $($_.Exception.Message)" }
+
+            # Ask the worker to stop cooperatively first; PowerShell.Stop() blocks until
+            # the pipeline yields, which an in-flight sign-in may not do promptly.
+            $operation.Shared.CancelRequested = $true
+            try { $operation.PowerShell.BeginStop($null, $null) | Out-Null } catch { Write-Debug "Stopping the worker failed: $($_.Exception.Message)" }
+            try { $operation.PowerShell.Dispose() } catch { Write-Debug "Disposing the worker failed: $($_.Exception.Message)" }
+            try { $operation.Runspace.Dispose() }  catch { Write-Debug "Disposing the runspace failed: $($_.Exception.Message)" }
             $ui.Operation = $null
         }
-        $timer.Stop()
+
         $timer.Dispose()
         Set-PimLogSink -Sink $null
     })

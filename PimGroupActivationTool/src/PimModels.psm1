@@ -223,11 +223,24 @@ function New-PimCustomCloudConfiguration {
         $reason = "Microsoft Graph environment '$graphName' does not expose a Graph endpoint. This environment likely requires an approved custom app registration, which this tool does not use."
     }
 
+    # A locally registered environment can advertise any endpoint, so a bad one must
+    # degrade this single entry rather than abort the whole cloud list.
+    $normalizedBaseUri = $null
+    if (-not [string]::IsNullOrWhiteSpace($graphBaseUri)) {
+        try {
+            $normalizedBaseUri = Format-PimBaseUri -Uri $graphBaseUri
+        }
+        catch {
+            $normalizedBaseUri = $null
+            $reason = $_.Exception.Message
+        }
+    }
+
     [pscustomobject]@{
         DisplayName       = "Custom: $azName"
         AzEnvironment     = $azName
         GraphEnvironment  = $graphName
-        GraphBaseUri      = (Format-PimBaseUri -Uri $graphBaseUri)
+        GraphBaseUri      = $normalizedBaseUri
         IsBuiltIn         = $false
         IsSupported       = [bool]([string]::IsNullOrWhiteSpace($reason))
         UnsupportedReason = $reason
@@ -238,6 +251,11 @@ function Format-PimBaseUri {
     <#
     .SYNOPSIS
         Normalizes a base URI by trimming trailing slashes.
+
+    .DESCRIPTION
+        Rejects any scheme other than https. Base URIs can come from locally registered
+        Azure environments, and a plain-http endpoint would send bearer-authenticated
+        requests in cleartext.
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -249,7 +267,13 @@ function Format-PimBaseUri {
     )
 
     if ([string]::IsNullOrWhiteSpace($Uri)) { return $null }
-    return $Uri.TrimEnd('/')
+
+    $trimmed = $Uri.TrimEnd('/')
+    if ($trimmed -match '^[A-Za-z][A-Za-z0-9+.\-]*://' -and $trimmed -notmatch '^(?i)https://') {
+        throw "Graph endpoint '$Uri' must use https. Bearer tokens are never sent over an unencrypted connection."
+    }
+
+    return $trimmed
 }
 
 function Get-PimPropertyValue {
@@ -853,6 +877,48 @@ function Remove-PimSensitiveData {
     }
 }
 
+function ConvertTo-PimSafeCsvValue {
+    <#
+    .SYNOPSIS
+        Neutralizes spreadsheet formula injection in a value bound for a CSV cell.
+
+    .DESCRIPTION
+        Group and tenant display names come from directories the user does not
+        administer - this tool is built to enumerate B2B guest tenants - so an
+        administrator in a foreign tenant can name a group something like
+        =cmd|'/c calc'!A1 and have Excel evaluate it when the victim opens the export.
+        Export-Csv quoting does not help, because Excel strips the quotes and still
+        evaluates a leading formula character.
+
+        Values that begin with =, +, -, @, tab, or carriage return are prefixed with an
+        apostrophe, which Excel treats as "this cell is literal text". Embedded newlines
+        are collapsed so a single value cannot fake additional rows.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(ValueFromPipeline)]
+        [AllowNull()]
+        [AllowEmptyString()]
+        [object] $Value
+    )
+
+    process {
+        if ($null -eq $Value) { return $null }
+
+        $text = [string]$Value
+        if ($text.Length -eq 0) { return $text }
+
+        $text = $text -replace '[\r\n]+', ' '
+
+        if ($text[0] -match "^[=+\-@\t]") {
+            return "'" + $text
+        }
+
+        return $text
+    }
+}
+
 # Ordered list of matchers that turn a raw Graph/MSAL failure into something a
 # non-PowerShell user can act on.
 $script:FriendlyErrorRules = @(
@@ -1276,6 +1342,7 @@ Export-ModuleMember -Function @(
     'New-PimActivationRequestBody'
     'Assert-PimGuid'
     'Remove-PimSensitiveData'
+    'ConvertTo-PimSafeCsvValue'
     'Format-PimGraphError'
     'ConvertTo-PimErrorText'
     'ConvertTo-PimExceptionText'

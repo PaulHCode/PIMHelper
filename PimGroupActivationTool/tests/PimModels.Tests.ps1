@@ -196,6 +196,79 @@ Describe 'Get-PimCloudConfiguration' {
             $cloud.PSObject.Properties['Name'] | Should -BeNullOrEmpty
         }
     }
+
+    It 'marks a custom environment unsupported when its Graph endpoint is not https' {
+        # One bad local registration must degrade a single entry, not abort the list.
+        $clouds = @(Get-PimCloudConfiguration `
+            -AzEnvironment @([pscustomobject]@{ Name = 'ContosoSovereign' }) `
+            -GraphEnvironment @([pscustomobject]@{ Name = 'ContosoSovereign'; GraphEndpoint = 'http://graph.contoso.example' }))
+
+        $clouds.Count | Should -BeGreaterThan 3
+        $custom = $clouds | Where-Object { -not $_.IsBuiltIn }
+        $custom.IsSupported       | Should -BeFalse
+        $custom.UnsupportedReason | Should -Match 'https'
+        $custom.GraphBaseUri      | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Format-PimBaseUri' {
+    It 'trims trailing slashes' {
+        Format-PimBaseUri -Uri 'https://graph.microsoft.com/' | Should -Be 'https://graph.microsoft.com'
+    }
+
+    It 'returns null for empty input' {
+        Format-PimBaseUri -Uri '' | Should -BeNullOrEmpty
+    }
+
+    It 'leaves a relative path alone' {
+        Format-PimBaseUri -Uri 'v1.0/me' | Should -Be 'v1.0/me'
+    }
+
+    It 'rejects a plain-http endpoint so bearer tokens are never sent in the clear' {
+        { Format-PimBaseUri -Uri 'http://graph.contoso.example' } | Should -Throw -ExpectedMessage '*must use https*'
+    }
+
+    It 'rejects a non-http scheme' {
+        { Format-PimBaseUri -Uri 'ftp://graph.contoso.example' } | Should -Throw -ExpectedMessage '*must use https*'
+    }
+}
+
+Describe 'ConvertTo-PimSafeCsvValue' {
+    It 'passes an ordinary value through unchanged' {
+        ConvertTo-PimSafeCsvValue -Value 'Contoso Admins' | Should -Be 'Contoso Admins'
+    }
+
+    It 'neutralizes a value that Excel would evaluate as a formula' -ForEach @(
+        @{ Value = "=cmd|'/c calc'!A1" }
+        @{ Value = '+1+1' }
+        @{ Value = '-1+1' }
+        @{ Value = '@SUM(A1:A9)' }
+        @{ Value = "`tleading tab" }
+    ) {
+        $result = ConvertTo-PimSafeCsvValue -Value $Value
+        $result[0] | Should -Be "'"
+        $result | Should -Be ("'" + $Value)
+    }
+
+    It 'collapses embedded newlines so one value cannot fake extra rows' {
+        ConvertTo-PimSafeCsvValue -Value "Contoso`r`nAdmins" | Should -Be 'Contoso Admins'
+    }
+
+    It 'returns null and empty values unchanged' {
+        ConvertTo-PimSafeCsvValue -Value $null  | Should -BeNullOrEmpty
+        ConvertTo-PimSafeCsvValue -Value ''     | Should -Be ''
+    }
+
+    It 'does not double-prefix a value that is already escaped' {
+        # A leading apostrophe is not a formula character, so it passes through once.
+        ConvertTo-PimSafeCsvValue -Value "'=1+1" | Should -Be "'=1+1"
+    }
+
+    It 'accepts pipeline input' {
+        $results = @('=1+1', 'normal') | ConvertTo-PimSafeCsvValue
+        $results[0] | Should -Be "'=1+1"
+        $results[1] | Should -Be 'normal'
+    }
 }
 
 Describe 'Get-PimPropertyValue' {

@@ -55,6 +55,9 @@
 .PARAMETER NoLog
     Disables file logging for this run.
 
+.PARAMETER UseDeviceAuthentication
+    Signs in with a device code instead of a browser. Use this over a remote session.
+
 .PARAMETER SkipModuleCheck
     Skips the prerequisite module check. Use only when you know the modules are present.
 
@@ -132,6 +135,8 @@ param(
 
     [switch] $NoLog,
 
+    [switch] $UseDeviceAuthentication,
+
     [switch] $SkipModuleCheck
 )
 
@@ -159,6 +164,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Gui' -and [System.Threading.Thread]::Current
     if ($PSBoundParameters.ContainsKey('Cloud'))   { $arguments += @('-Cloud', $Cloud) }
     if ($PSBoundParameters.ContainsKey('LogPath')) { $arguments += @('-LogPath', $LogPath) }
     if ($NoLog)                                    { $arguments += '-NoLog' }
+    if ($UseDeviceAuthentication)                  { $arguments += '-UseDeviceAuthentication' }
     if ($SkipModuleCheck)                          { $arguments += '-SkipModuleCheck' }
 
     $env:PIM_STA_RELAUNCHED = '1'
@@ -280,7 +286,8 @@ if (-not $cloudConfiguration.IsSupported) {
 # ---------------------------------------------------------------------------
 
 if ($isGui) {
-    Show-PimMainForm -CloudName $cloudConfiguration.DisplayName
+    $logState = Get-PimLogState
+    Show-PimMainForm -CloudName $cloudConfiguration.DisplayName -LogDirectory $logState.Directory
     exit 0
 }
 
@@ -295,7 +302,7 @@ function Connect-PimHeadlessTenant {
         [string] $Tenant
     )
 
-    $connection = Connect-PimGraphTenant -TenantId $Tenant -CloudConfiguration $cloudConfiguration
+    $connection = Connect-PimGraphTenant -TenantId $Tenant -CloudConfiguration $cloudConfiguration -UseDeviceAuthentication:$UseDeviceAuthentication
     if (-not $connection.Success) {
         throw $connection.Message
     }
@@ -311,7 +318,7 @@ function Get-PimHeadlessTenantList {
     [CmdletBinding()]
     param()
 
-    $signIn = Connect-PimAzureAccount -CloudConfiguration $cloudConfiguration
+    $signIn = Connect-PimAzureAccount -CloudConfiguration $cloudConfiguration -UseDeviceAuthentication:$UseDeviceAuthentication
     Write-Host "Signed in as $($signIn.Account) ($($cloudConfiguration.DisplayName))." -ForegroundColor Green
 
     $tenants = Get-PimAuthorizedTenant -CloudConfiguration $cloudConfiguration
@@ -359,7 +366,7 @@ if ($ListGroups) {
         }
         catch {
             # One unreachable tenant must not abort the sweep.
-            Write-Warning "  $($tenant.TenantDisplayName): $(ConvertTo-PimErrorText -ErrorObject $_)"
+            Write-Warning "  $($tenant.TenantDisplayName): $(Remove-PimSensitiveData -Text (ConvertTo-PimErrorText -ErrorObject $_))"
         }
     }
 
@@ -382,7 +389,7 @@ if ($ListActive) {
             Write-Host "  $($active.Count) active assignment(s)." -ForegroundColor Green
         }
         catch {
-            Write-Warning "  $($tenant.TenantDisplayName): $(ConvertTo-PimErrorText -ErrorObject $_)"
+            Write-Warning "  $($tenant.TenantDisplayName): $(Remove-PimSensitiveData -Text (ConvertTo-PimErrorText -ErrorObject $_))"
         }
     }
 
@@ -401,10 +408,10 @@ if ($Activate) {
     }
 
     $tenant = $TenantId[0]
-    Assert-PimGuid -Value $tenant -Name 'TenantId'
-    foreach ($id in $GroupId) { Assert-PimGuid -Value $id -Name 'GroupId' }
+    Assert-PimGuid -Value $tenant -ParameterName 'TenantId'
+    foreach ($id in $GroupId) { Assert-PimGuid -Value $id -ParameterName 'GroupId' }
 
-    $null = Connect-PimAzureAccount -CloudConfiguration $cloudConfiguration
+    $null = Connect-PimAzureAccount -CloudConfiguration $cloudConfiguration -UseDeviceAuthentication:$UseDeviceAuthentication
     $null = Connect-PimHeadlessTenant -Tenant $tenant
     $me = Get-CurrentGraphUser -GraphBaseUri $cloudConfiguration.GraphBaseUri
     Write-Host "Activating as $($me.UserPrincipalName) in tenant $tenant." -ForegroundColor Cyan

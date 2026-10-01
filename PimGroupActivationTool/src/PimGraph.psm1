@@ -19,7 +19,10 @@ Import-Module (Join-Path -Path $PSScriptRoot -ChildPath 'PimModels.psm1') -Disab
 Import-Module (Join-Path -Path $PSScriptRoot -ChildPath 'PimLogging.psm1') -DisableNameChecking -ErrorAction Stop
 
 # Delegated scopes requested from the Microsoft Graph PowerShell enterprise application.
+# User.Read is needed because the signed-in user's object ID differs in every tenant and
+# is read from /me before eligibility can be filtered by principal.
 $script:DefaultGraphScopes = @(
+    'User.Read'
     'PrivilegedEligibilitySchedule.Read.AzureADGroup'
     'PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup'
     'Group.Read.All'
@@ -29,6 +32,7 @@ $script:DefaultGraphScopes = @(
 # full scope set cannot be consented in a tenant; group display names then fall back
 # to group IDs.
 $script:MinimumGraphScopes = @(
+    'User.Read'
     'PrivilegedEligibilitySchedule.Read.AzureADGroup'
     'PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup'
 )
@@ -269,6 +273,10 @@ function Connect-PimAzureAccount {
 
     .PARAMETER Force
         Always sign in again, even when a usable context exists.
+
+    .PARAMETER UseDeviceAuthentication
+        Sign in with a device code instead of a browser. Needed where no browser can be
+        launched, such as a remote session.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -277,7 +285,10 @@ function Connect-PimAzureAccount {
         [object] $CloudConfiguration,
 
         [Parameter()]
-        [switch] $Force
+        [switch] $Force,
+
+        [Parameter()]
+        [switch] $UseDeviceAuthentication
     )
 
     if (-not $CloudConfiguration.IsSupported) {
@@ -306,6 +317,7 @@ function Connect-PimAzureAccount {
             Scope       = 'Process'
             ErrorAction = 'Stop'
         }
+        if ($UseDeviceAuthentication) { $connectParameters['UseDeviceAuthentication'] = $true }
 
         try {
             $null = Invoke-PimExternalCommand -Name 'Connect-AzAccount' -Parameters $connectParameters
@@ -366,6 +378,10 @@ function Disconnect-PimAzureAccount {
             Write-PimLog -Level Debug -Operation 'Disconnect-Azure' -Message "$name reported: $($_.Exception.Message)"
         }
     }
+
+    # A cached display name was resolved under the previous account's permissions, so
+    # it must not survive a sign-out.
+    Clear-PimGroupCache
 
     Write-PimLog -Operation 'Disconnect-Azure' -Status 'Succeeded' -Message 'Cleared the process-scoped Az context.'
 }
@@ -512,7 +528,10 @@ function Connect-PimGraphTenant {
         [string[]] $FallbackScopes,
 
         [Parameter()]
-        [switch] $Force
+        [switch] $Force,
+
+        [Parameter()]
+        [switch] $UseDeviceAuthentication
     )
 
     if (-not $Scopes)         { $Scopes = $script:DefaultGraphScopes }
@@ -544,7 +563,7 @@ function Connect-PimGraphTenant {
         Write-PimLog -Operation 'Connect-Graph' -TenantId $TenantId -Message "Connecting to Microsoft Graph environment '$graphEnvironment' with $($attempt.Scopes.Count) scope(s)."
 
         try {
-            $null = Invoke-PimExternalCommand -Name 'Connect-MgGraph' -Parameters @{
+            $connectParameters = @{
                 TenantId     = $TenantId
                 Scopes       = [string[]]$attempt.Scopes
                 Environment  = $graphEnvironment
@@ -552,6 +571,9 @@ function Connect-PimGraphTenant {
                 NoWelcome    = $true
                 ErrorAction  = 'Stop'
             }
+            if ($UseDeviceAuthentication) { $connectParameters['UseDeviceCode'] = $true }
+
+            $null = Invoke-PimExternalCommand -Name 'Connect-MgGraph' -Parameters $connectParameters
 
             $context = Get-PimGraphContext
             if (-not (Test-PimGraphContext -Context $context -TenantId $TenantId -GraphEnvironment $graphEnvironment)) {
@@ -714,7 +736,10 @@ function Invoke-PimGraphRequest {
     )
 
     $requestUri = $Uri
-    if ($requestUri -notmatch '^(?i)https?://') {
+    if ($requestUri -notmatch '^(?i)https://') {
+        if ($requestUri -match '^[A-Za-z][A-Za-z0-9+.\-]*://') {
+            throw "Graph requests must use https. Received '$(Get-PimSafeUri -Uri $requestUri)'."
+        }
         if ([string]::IsNullOrWhiteSpace($GraphBaseUri)) {
             throw 'GraphBaseUri is required when Uri is a relative path.'
         }
@@ -749,6 +774,17 @@ function Invoke-PimGraphRequest {
 
             if ($attempt -gt $MaximumRetryCount -or $null -eq $retryAfter) {
                 throw
+            }
+
+            # A POST that times out or returns 5xx may already have been accepted, so
+            # retrying it could create a duplicate activation request. Only throttling
+            # is safe to repeat, because a throttled request was never processed.
+            if ($Method -notin 'GET', 'HEAD', 'PUT', 'DELETE') {
+                $errorText = ConvertTo-PimErrorText -ErrorObject $_
+                if (-not [regex]::IsMatch($errorText, '(?i)\b429\b|TooManyRequests|throttl')) {
+                    Write-PimLog -Level Warning -Operation 'Graph-Request' -Message "$Method $(Get-PimSafeUri -Uri $requestUri) failed and will not be retried, because the request may already have been processed."
+                    throw
+                }
             }
 
             Write-PimLog -Level Warning -Operation 'Graph-Request' -Message "$Method $(Get-PimSafeUri -Uri $requestUri) failed with a retryable error. Retry $attempt of $MaximumRetryCount in $retryAfter second(s)."
@@ -863,12 +899,22 @@ function Get-PimGraphCollection {
     $items = New-Object System.Collections.Generic.List[object]
     $nextUri = $Uri
     $page = 0
+    $seenUris = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 
     while (-not [string]::IsNullOrWhiteSpace($nextUri)) {
         $page++
         if ($page -gt $MaximumPageCount) {
-            Write-PimLog -Level Warning -Operation 'Graph-Paging' -Message "Stopped after $MaximumPageCount pages for $(Get-PimSafeUri -Uri $Uri)."
-            break
+            # Returning a partial list here would be indistinguishable from a complete
+            # one, and a user would silently miss groups they are eligible for.
+            $message = "Stopped after $MaximumPageCount pages for $(Get-PimSafeUri -Uri $Uri). The result would be incomplete."
+            Write-PimLog -Level Error -Operation 'Graph-Paging' -Status 'Failed' -Message $message
+            throw $message
+        }
+
+        if (-not $seenUris.Add([string]$nextUri)) {
+            $message = "Microsoft Graph returned a repeating page link for $(Get-PimSafeUri -Uri $Uri)."
+            Write-PimLog -Level Error -Operation 'Graph-Paging' -Status 'Failed' -Message $message
+            throw $message
         }
 
         $response = Invoke-PimGraphRequest -Uri $nextUri -Method GET -GraphBaseUri $GraphBaseUri
@@ -958,6 +1004,10 @@ function Resolve-PimGroup {
     if ($script:GroupCache.ContainsKey($cacheKey)) {
         return $script:GroupCache[$cacheKey]
     }
+
+    # The ID comes from a Graph response rather than user input, but it is about to be
+    # interpolated into a URI path, so validate it anyway.
+    Assert-PimGuid -Value $GroupId -ParameterName 'GroupId'
 
     $result = [pscustomobject]@{
         Id          = $GroupId
@@ -1065,6 +1115,10 @@ function Get-PimEligibleGroups {
 
     $baseUri = Format-PimBaseUri -Uri $GraphBaseUri
     $schedules = $null
+
+    # PrincipalId is interpolated into an OData filter below, so validate it even
+    # though it originates from a Graph /me response.
+    Assert-PimGuid -Value $PrincipalId -ParameterName 'PrincipalId'
 
     $queries = @(
         "$baseUri/v1.0/identityGovernance/privilegedAccess/group/eligibilitySchedules/filterByCurrentUser(on='principal')"
@@ -1281,6 +1335,10 @@ function Get-PimActiveGroupAssignment {
     .DESCRIPTION
         Used to show which eligible groups are already active so the user does not
         resubmit an activation that will be rejected.
+
+        Pass -IgnoreFailure when the caller only wants a best-effort decoration of an
+        existing list. Without it, a failure is thrown so the caller can tell "nothing
+        is active" apart from "the query did not run".
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -1291,7 +1349,10 @@ function Get-PimActiveGroupAssignment {
         [Parameter()]
         [AllowNull()]
         [AllowEmptyString()]
-        [string] $TenantId
+        [string] $TenantId,
+
+        [Parameter()]
+        [switch] $IgnoreFailure
     )
 
     $baseUri = Format-PimBaseUri -Uri $GraphBaseUri
@@ -1301,8 +1362,10 @@ function Get-PimActiveGroupAssignment {
         $schedules = Get-PimGraphCollection -Uri $uri
     }
     catch {
-        Write-PimLog -Level Debug -Operation 'Get-Active' -TenantId $TenantId -Message "Could not read active assignments: $($_.Exception.Message)"
-        return , ([object[]]@())
+        $formatted = Format-PimGraphError -ErrorObject $_ -Context 'Could not read active assignments.'
+        Write-PimLog -Level Warning -Operation 'Get-Active' -TenantId $TenantId -Status 'Failed' -Message $formatted.Detail
+        if ($IgnoreFailure) { return , ([object[]]@()) }
+        throw $formatted.FriendlyMessage
     }
 
     $records = New-Object System.Collections.Generic.List[object]
