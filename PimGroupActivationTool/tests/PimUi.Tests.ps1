@@ -23,6 +23,59 @@ AfterAll {
 
 Describe 'PimUi' {
 
+Describe 'Stop-PimUiOperation' {
+    It 'returns promptly when the worker refuses to yield' {
+        # This runs on the UI thread inside FormClosing, where anything that waits
+        # shows the user a frozen window. Thread::Sleep does not yield to Stop(),
+        # which is how an in-flight interactive sign-in behaves.
+        $runspace = [runspacefactory]::CreateRunspace()
+        $runspace.ApartmentState = 'STA'
+        $runspace.Open()
+
+        $ps = [powershell]::Create()
+        $ps.Runspace = $runspace
+        $null = $ps.AddScript('[System.Threading.Thread]::Sleep(4000)')
+        $handle = $ps.BeginInvoke()
+
+        # Let the pipeline actually enter the sleep before asking it to stop.
+        Start-Sleep -Milliseconds 400
+
+        $shared = New-PimSharedState
+        $operation = [pscustomobject]@{ PowerShell = $ps; Runspace = $runspace; Shared = $shared }
+
+        $elapsed = Measure-Command { $script:Disposed = Stop-PimUiOperation -Operation $operation }
+
+        try {
+            $elapsed.TotalSeconds | Should -BeLessThan 2 -Because 'the UI thread must not wait for a worker that will not yield'
+            $script:Disposed      | Should -BeFalse -Because 'disposing would have blocked, so the handles are left to process exit'
+            $shared.CancelRequested | Should -BeTrue
+        }
+        finally {
+            $null = $handle
+            try { $ps.Dispose() }       catch { }
+            try { $runspace.Dispose() } catch { }
+        }
+    }
+
+    It 'reclaims the handles when the worker has already finished' {
+        $runspace = [runspacefactory]::CreateRunspace()
+        $runspace.Open()
+
+        $ps = [powershell]::Create()
+        $ps.Runspace = $runspace
+        $null = $ps.AddScript('1')
+        $null = $ps.Invoke()
+
+        $operation = [pscustomobject]@{ PowerShell = $ps; Runspace = $runspace; Shared = (New-PimSharedState) }
+
+        Stop-PimUiOperation -Operation $operation | Should -BeTrue
+    }
+
+    It 'does nothing when there is no operation' {
+        Stop-PimUiOperation -Operation $null | Should -BeFalse
+    }
+}
+
 Describe 'New-PimSharedState' {
     It 'creates a synchronized hashtable with the progress fields' {
         $shared = New-PimSharedState

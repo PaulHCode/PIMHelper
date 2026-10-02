@@ -133,6 +133,53 @@ function Get-PimAsyncStreamText {
     return , ([object[]]$lines.ToArray())
 }
 
+function Stop-PimUiOperation {
+    <#
+    .SYNOPSIS
+        Abandons a running worker without blocking the caller.
+
+    .DESCRIPTION
+        Called from FormClosing, which runs on the UI thread with no message
+        pump, so anything that waits here shows the user a frozen window.
+
+        PowerShell.Stop() blocks until the pipeline yields, which is why the stop
+        is started asynchronously. Dispose() on either the PowerShell or the
+        Runspace waits for exactly the same thing, so disposing immediately
+        afterwards would undo that: an in-flight sign-in can sit in a browser
+        prompt or a device-code poll for minutes without ever yielding.
+
+        The handles are therefore reclaimed only when the pipeline has already
+        finished. Otherwise they are left to process exit, which is the correct
+        trade for a window the user has just asked to close.
+
+    .OUTPUTS
+        [bool] $true when the handles were disposed, $false when they were left.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter()]
+        [AllowNull()]
+        [object] $Operation
+    )
+
+    if ($null -eq $Operation) { return $false }
+
+    if ($null -ne $Operation.Shared) { $Operation.Shared.CancelRequested = $true }
+
+    try { $null = $Operation.PowerShell.BeginStop($null, $null) }
+    catch { Write-Debug "Stopping the worker failed: $($_.Exception.Message)" }
+
+    $state = ''
+    try { $state = [string]$Operation.PowerShell.InvocationStateInfo.State } catch { }
+
+    if (@('Completed', 'Failed', 'Stopped') -notcontains $state) { return $false }
+
+    try { $Operation.PowerShell.Dispose() } catch { Write-Debug "Disposing the worker failed: $($_.Exception.Message)" }
+    try { $Operation.Runspace.Dispose() }  catch { Write-Debug "Disposing the runspace failed: $($_.Exception.Message)" }
+    return $true
+}
+
 function Complete-PimAsyncOperation {
     <#
     .SYNOPSIS
@@ -1449,12 +1496,8 @@ function Show-PimMainForm {
                 return
             }
 
-            # Ask the worker to stop cooperatively first; PowerShell.Stop() blocks until
-            # the pipeline yields, which an in-flight sign-in may not do promptly.
-            $operation.Shared.CancelRequested = $true
-            try { $operation.PowerShell.BeginStop($null, $null) | Out-Null } catch { Write-Debug "Stopping the worker failed: $($_.Exception.Message)" }
-            try { $operation.PowerShell.Dispose() } catch { Write-Debug "Disposing the worker failed: $($_.Exception.Message)" }
-            try { $operation.Runspace.Dispose() }  catch { Write-Debug "Disposing the runspace failed: $($_.Exception.Message)" }
+            # Hand the worker off rather than waiting for it; see Stop-PimUiOperation.
+            $null = Stop-PimUiOperation -Operation $operation
             $ui.Operation = $null
         }
 
@@ -1480,6 +1523,7 @@ Export-ModuleMember -Function @(
     'Start-PimAsyncOperation'
     'Get-PimAsyncStreamText'
     'Complete-PimAsyncOperation'
+    'Stop-PimUiOperation'
     'New-PimDataGridView'
     'Add-PimGridTextColumn'
     'Add-PimGridCheckBoxColumn'
