@@ -184,7 +184,7 @@ Describe 'Get-PimCloudConfiguration' {
             -AzEnvironment @([pscustomobject]@{ Name = 'ContosoSovereign' }) `
             -GraphEnvironment @([pscustomobject]@{ Name = 'ContosoSovereign'; GraphEndpoint = 'https://graph.contoso.example' }))
 
-        $expected = @('AzEnvironment', 'DisplayName', 'GraphBaseUri', 'GraphEnvironment', 'IsBuiltIn', 'IsSupported', 'UnsupportedReason')
+        $expected = @('AzEnvironment', 'DisplayName', 'GraphBaseUri', 'GraphEnvironment', 'IsBuiltIn', 'IsSupported', 'LoginBaseUri', 'UnsupportedReason')
         foreach ($cloud in $clouds) {
             $actual = @($cloud.PSObject.Properties.Name | Sort-Object)
             ($actual -join ',') | Should -Be ($expected -join ',') -Because "cloud '$($cloud.DisplayName)' must match the shared shape"

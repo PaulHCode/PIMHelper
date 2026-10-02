@@ -189,7 +189,7 @@ Describe 'LoadGroupsWorker' {
         # Get-CurrentGraphUser. Using $connection.PrincipalId broke group enumeration.
         $graph = New-StubGraphModule -Body @'
 function Connect-PimGraphTenant {
-    [CmdletBinding()] param([string] $TenantId, $CloudConfiguration, [switch] $UseDeviceAuthentication, [switch] $NoDeviceCode, [string] $ExpectedAccount)
+    [CmdletBinding()] param([string] $TenantId, $CloudConfiguration, [switch] $UseDeviceAuthentication, [string] $ExpectedAccount)
     Add-StubCall "Connect $TenantId account=$ExpectedAccount"
     [pscustomobject]@{ Success = $true; TenantId = $TenantId; Context = $null; Scopes = @(); HasGroupRead = $true; Message = 'ok'; Detail = '' }
 }
@@ -229,7 +229,7 @@ Export-ModuleMember -Function @('Connect-PimGraphTenant', 'Get-CurrentGraphUser'
     It 'records a per-tenant failure and still processes the remaining tenants' {
         $graph = New-StubGraphModule -Body @'
 function Connect-PimGraphTenant {
-    [CmdletBinding()] param([string] $TenantId, $CloudConfiguration, [switch] $UseDeviceAuthentication, [switch] $NoDeviceCode, [string] $ExpectedAccount)
+    [CmdletBinding()] param([string] $TenantId, $CloudConfiguration, [switch] $UseDeviceAuthentication, [string] $ExpectedAccount)
     if ($TenantId -like '1111*') {
         return [pscustomobject]@{ Success = $false; TenantId = $TenantId; Context = $null; Scopes = @(); HasGroupRead = $false; Message = 'Consent was blocked.'; Detail = '' }
     }
@@ -258,7 +258,7 @@ Export-ModuleMember -Function @('Connect-PimGraphTenant', 'Get-CurrentGraphUser'
     It 'reports an eligibility failure per tenant instead of aborting the run' {
         $graph = New-StubGraphModule -Body @'
 function Connect-PimGraphTenant {
-    [CmdletBinding()] param([string] $TenantId, $CloudConfiguration, [switch] $UseDeviceAuthentication, [switch] $NoDeviceCode, [string] $ExpectedAccount)
+    [CmdletBinding()] param([string] $TenantId, $CloudConfiguration, [switch] $UseDeviceAuthentication, [string] $ExpectedAccount)
     [pscustomobject]@{ Success = $true; TenantId = $TenantId; Context = $null; Scopes = @(); HasGroupRead = $true; Message = 'ok'; Detail = '' }
 }
 function Get-CurrentGraphUser { [CmdletBinding()] param([string] $GraphBaseUri) [pscustomobject]@{ Id = '33333333-3333-3333-3333-333333333333' } }
@@ -282,7 +282,7 @@ Export-ModuleMember -Function @('Connect-PimGraphTenant', 'Get-CurrentGraphUser'
     It 'skips group name resolution when Group.Read.All was not consented' {
         $graph = New-StubGraphModule -Body @'
 function Connect-PimGraphTenant {
-    [CmdletBinding()] param([string] $TenantId, $CloudConfiguration, [switch] $UseDeviceAuthentication, [switch] $NoDeviceCode, [string] $ExpectedAccount)
+    [CmdletBinding()] param([string] $TenantId, $CloudConfiguration, [switch] $UseDeviceAuthentication, [string] $ExpectedAccount)
     [pscustomobject]@{ Success = $true; TenantId = $TenantId; Context = $null; Scopes = @(); HasGroupRead = $false; Message = 'Reduced permissions.'; Detail = '' }
 }
 function Get-CurrentGraphUser { [CmdletBinding()] param([string] $GraphBaseUri) [pscustomobject]@{ Id = '33333333-3333-3333-3333-333333333333' } }
@@ -302,7 +302,7 @@ Export-ModuleMember -Function @('Connect-PimGraphTenant', 'Get-CurrentGraphUser'
     It 'stops early when cancellation is requested' {
         $graph = New-StubGraphModule -Body @'
 function Connect-PimGraphTenant {
-    [CmdletBinding()] param([string] $TenantId, $CloudConfiguration, [switch] $UseDeviceAuthentication, [switch] $NoDeviceCode, [string] $ExpectedAccount)
+    [CmdletBinding()] param([string] $TenantId, $CloudConfiguration, [switch] $UseDeviceAuthentication, [string] $ExpectedAccount)
     Add-StubCall "Connect $TenantId"
     [pscustomobject]@{ Success = $true; TenantId = $TenantId; Context = $null; Scopes = @(); HasGroupRead = $true; Message = 'ok'; Detail = '' }
 }
@@ -334,7 +334,7 @@ Export-ModuleMember -Function @('Connect-PimGraphTenant', 'Get-CurrentGraphUser'
     It 'accounts for the tenants it never reached when cancelled midway' {
         $graph = New-StubGraphModule -Body @'
 function Connect-PimGraphTenant {
-    [CmdletBinding()] param([string] $TenantId, $CloudConfiguration, [switch] $UseDeviceAuthentication, [switch] $NoDeviceCode, [string] $ExpectedAccount)
+    [CmdletBinding()] param([string] $TenantId, $CloudConfiguration, [switch] $UseDeviceAuthentication, [string] $ExpectedAccount)
     Add-StubCall "Connect $TenantId"
     [pscustomobject]@{ Success = $true; TenantId = $TenantId; Context = $null; Scopes = @(); HasGroupRead = $true; Message = 'ok'; Detail = '' }
 }
@@ -374,7 +374,7 @@ Describe 'SubmitWorker' {
     It 'submits every selected group and reports success' {
         $graph = New-StubGraphModule -Body @'
 function Connect-PimGraphTenant {
-    [CmdletBinding()] param([string] $TenantId, $CloudConfiguration, [switch] $UseDeviceAuthentication, [switch] $NoDeviceCode, [string] $ExpectedAccount)
+    [CmdletBinding()] param([string] $TenantId, $CloudConfiguration, [switch] $UseDeviceAuthentication, [string] $ExpectedAccount)
     Add-StubCall "Connect $TenantId"
     [pscustomobject]@{ Success = $true; TenantId = $TenantId; Context = $null; Scopes = @(); HasGroupRead = $true; Message = 'ok'; Detail = '' }
 }
@@ -407,7 +407,7 @@ Export-ModuleMember -Function @('Connect-PimGraphTenant', 'Get-CurrentGraphUser'
 
         $graph = New-StubGraphModule -Body @'
 function Connect-PimGraphTenant {
-    [CmdletBinding()] param([string] $TenantId, $CloudConfiguration, [switch] $UseDeviceAuthentication, [switch] $NoDeviceCode, [string] $ExpectedAccount)
+    [CmdletBinding()] param([string] $TenantId, $CloudConfiguration, [switch] $UseDeviceAuthentication, [string] $ExpectedAccount)
     [pscustomobject]@{ Success = $true; TenantId = $TenantId; Context = $null; Scopes = @(); HasGroupRead = $true; Message = 'ok'; Detail = '' }
 }
 function Get-CurrentGraphUser { [CmdletBinding()] param([string] $GraphBaseUri) [pscustomobject]@{ Id = '99999999-9999-9999-9999-999999999999' } }
@@ -429,7 +429,7 @@ Export-ModuleMember -Function @('Connect-PimGraphTenant', 'Get-CurrentGraphUser'
     It 'marks every group skipped when the tenant connection fails' {
         $graph = New-StubGraphModule -Body @'
 function Connect-PimGraphTenant {
-    [CmdletBinding()] param([string] $TenantId, $CloudConfiguration, [switch] $UseDeviceAuthentication, [switch] $NoDeviceCode, [string] $ExpectedAccount)
+    [CmdletBinding()] param([string] $TenantId, $CloudConfiguration, [switch] $UseDeviceAuthentication, [string] $ExpectedAccount)
     [pscustomobject]@{ Success = $false; TenantId = $TenantId; Context = $null; Scopes = @(); HasGroupRead = $false; Message = 'Conditional Access blocked the sign-in.'; Detail = '' }
 }
 function Get-CurrentGraphUser { [CmdletBinding()] param([string] $GraphBaseUri) [pscustomobject]@{ Id = 'x' } }
@@ -452,7 +452,7 @@ Export-ModuleMember -Function @('Connect-PimGraphTenant', 'Get-CurrentGraphUser'
     It 'stops after the first failure when asked to' {
         $graph = New-StubGraphModule -Body @'
 function Connect-PimGraphTenant {
-    [CmdletBinding()] param([string] $TenantId, $CloudConfiguration, [switch] $UseDeviceAuthentication, [switch] $NoDeviceCode, [string] $ExpectedAccount)
+    [CmdletBinding()] param([string] $TenantId, $CloudConfiguration, [switch] $UseDeviceAuthentication, [string] $ExpectedAccount)
     [pscustomobject]@{ Success = $true; TenantId = $TenantId; Context = $null; Scopes = @(); HasGroupRead = $true; Message = 'ok'; Detail = '' }
 }
 function Get-CurrentGraphUser { [CmdletBinding()] param([string] $GraphBaseUri) [pscustomobject]@{ Id = '33333333-3333-3333-3333-333333333333' } }
@@ -477,7 +477,7 @@ Export-ModuleMember -Function @('Connect-PimGraphTenant', 'Get-CurrentGraphUser'
     It 'never silently drops a selected group' {
         $graph = New-StubGraphModule -Body @'
 function Connect-PimGraphTenant {
-    [CmdletBinding()] param([string] $TenantId, $CloudConfiguration, [switch] $UseDeviceAuthentication, [switch] $NoDeviceCode, [string] $ExpectedAccount)
+    [CmdletBinding()] param([string] $TenantId, $CloudConfiguration, [switch] $UseDeviceAuthentication, [string] $ExpectedAccount)
     [pscustomobject]@{ Success = $true; TenantId = $TenantId; Context = $null; Scopes = @(); HasGroupRead = $true; Message = 'ok'; Detail = '' }
 }
 function Get-CurrentGraphUser { [CmdletBinding()] param([string] $GraphBaseUri) [pscustomobject]@{ Id = '33333333-3333-3333-3333-333333333333' } }

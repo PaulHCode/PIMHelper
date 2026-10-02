@@ -92,7 +92,7 @@ pipeline, or when you just want one group activated quickly.
 | `-TicketNumber`, `-TicketSystem` | `-Activate` | Optional, recorded with the request when your policy asks for a ticket. |
 | `-LogPath` | all | Overrides the log file location. |
 | `-NoLog` | all | Disables file logging for this run. |
-| `-UseDeviceAuthentication` | headless modes | Signs in with a device code instead of a browser. Use this over SSH or in a session with no browser. Not available in the window — see below. |
+| `-UseDeviceAuthentication` | all | Signs in with a device code instead of a browser. Use this over SSH, in a remote session, or anywhere the sign-in broker cannot show a prompt. The code appears in the console or in the window's activity log. |
 | `-SkipModuleCheck` | all | Skips the prerequisite check. |
 
 ---
@@ -176,38 +176,32 @@ the broker crashes, it can fail without raising an error, and `Connect-MgGraph` 
 leaving `Get-MgContext` null. Microsoft.Graph.Authentication 2.25.0 and earlier swallow
 this completely, which is why 2.26.0 is the minimum version.
 
-Rather than stopping there, the headless modes notice the empty context and retry once
-with a device code, which needs no window. You will see a warning in the log and then a
-code to enter. Nothing is approved on your behalf — the code is yours to enter, and you
-still sign in yourself. Pass `-UseDeviceAuthentication` to skip the broker attempt
-entirely.
+Rather than stopping there, the tool notices the empty context and retries once with a
+device code, which needs no window. You will see a warning naming the code and where to
+enter it, in the console or in the window's activity log. Nothing is approved on your
+behalf — the code is yours to enter, and you still sign in yourself. Pass
+`-UseDeviceAuthentication` to skip the broker attempt entirely.
 
-**"A device code is needed to sign in, but this window has no way to show you one"**
-Device codes are a terminal-only option. The window runs its work on a background
-runspace, and the Graph SDK prints the code through the PowerShell host, which a
-background runspace does not have — the code is written to nowhere. Verified by running
-`Connect-MgGraph -UseDeviceCode` on a worker runspace and finding nothing on its
-information, warning, or error streams.
+The device code comes from the tool's own flow against the identity service, not from
+`Connect-MgGraph -UseDeviceCode`. The SDK prints its code through the PowerShell host,
+which a background runspace does not have, so in the window that code would be written
+to nowhere — verified by running `Connect-MgGraph -UseDeviceCode` on a worker runspace
+and finding nothing on its information, warning, or error streams. Issuing the code
+ourselves means it is ours to display, so device-code sign-in works in the window and in
+a terminal alike. No app registration is involved: the flow uses the same first-party
+Microsoft Graph Command Line Tools client as the rest of the tool.
 
-So rather than hang on a code you would never see, the window says this and stops. Run
-the headless mode from a terminal instead:
+**"No sign-in completed within N seconds"**
+The device code was issued but never entered. Start the sign-in again when you are ready
+to enter it. A code is only valid for about fifteen minutes.
 
-```powershell
-pwsh -File .\Start-PimGroupActivationTool.ps1 -ListGroups -TenantId <tenant> -UseDeviceAuthentication
-pwsh -File .\Start-PimGroupActivationTool.ps1 -Activate -TenantId <tenant> -GroupId <group> -Justification '...' -UseDeviceAuthentication
-```
+**"A device code sign-in was requested, but no sign-in endpoint is known for this cloud"**
+The built-in clouds all publish one. A custom Azure environment only does if it declares
+`ActiveDirectoryAuthority`, and it has to be `https`. Choose a built-in cloud, or sign in
+with a browser instead of a device code.
 
-If the broker works on your machine — which it usually does on a normal desktop session —
-the window signs in without any of this.
-
-*Known limitation:* Az.Accounts prints its device code through `Write-Host`, so the
-Azure half of a device-code sign-in does show up in the window's log. Only the Microsoft
-Graph half is invisible. Making the window handle device codes end to end would mean
-running the OAuth device-code flow directly instead of through the Graph SDK, so the tool
-owns the code string and can display it; that is not implemented.
-
-**"Microsoft Graph reported no error but left no sign-in context, with or without a device code"**
-Both sign-in methods came back empty, so this is not the broker. Check that
+**"Microsoft Graph reported no error but left no sign-in context"**
+Sign-in came back empty and no device code could be offered instead. Check that
 Microsoft.Graph.Authentication is installed and importable; the installed version is
 named in the message.
 

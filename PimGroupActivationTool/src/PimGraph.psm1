@@ -46,18 +46,13 @@ $script:RequiredModules = @(
 
 $script:CommandOverrides = @{}
 
-# The Graph SDK prints a device code through the PowerShell host. A worker runspace
-# is created without one, so the code goes nowhere the user can read it - verified by
-# running Connect-MgGraph -UseDeviceCode on a worker runspace and finding nothing on
-# the information, warning, or error streams.
-$script:DeviceCodeUnavailableMessage =
-    'A device code is needed to sign in, but this window has no way to show you one. ' +
-    'Sign in from a terminal instead, for example: ' +
-    'pwsh -File .\Start-PimGroupActivationTool.ps1 -ListGroups -TenantId <tenant> -UseDeviceAuthentication'
-
 # Cache of group display names keyed by "<tenantId>/<groupId>" so repeated loads do not
 # re-query Graph for the same group.
 $script:GroupCache = @{}
+
+# Microsoft Graph Command Line Tools. A first-party public client, so the device code
+# flow needs no secret and no app registration of our own.
+$script:GraphCommandLineClientId = '14d82eec-204b-4c2f-b7e8-296a70dab67e'
 
 function Get-PimDefaultGraphScope {
     [CmdletBinding()]
@@ -685,6 +680,325 @@ function Test-PimConnectSupportsLoginHint {
     }
 }
 
+function ConvertTo-PimResourceScope {
+    <#
+    .SYNOPSIS
+        Qualifies delegated scope names with the Graph resource they belong to.
+
+    .DESCRIPTION
+        Connect-MgGraph accepts bare scope names because it knows its own resource.
+        The token endpoint does not, so 'Group.Read.All' has to be sent as
+        'https://graph.microsoft.com/Group.Read.All'. OpenID scopes address the
+        identity service rather than a resource and must be left alone.
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [string[]] $Scope,
+
+        [Parameter(Mandatory)]
+        [string] $GraphBaseUri
+    )
+
+    $reserved = @('openid', 'profile', 'offline_access', 'email')
+    $base = Format-PimBaseUri -Uri $GraphBaseUri
+
+    $qualified = foreach ($name in $Scope) {
+        if ([string]::IsNullOrWhiteSpace($name)) { continue }
+        $trimmed = $name.Trim()
+
+        if ($reserved -contains $trimmed.ToLowerInvariant()) { $trimmed }
+        elseif ($trimmed -match '^https?://') { $trimmed }
+        else { "$base/$trimmed" }
+    }
+
+    # Comma-wrapped so a single scope stays an array instead of unrolling to a
+    # bare string, which would then index by character.
+    return , ([string[]]@($qualified))
+}
+
+function Read-PimOAuthError {
+    <#
+    .SYNOPSIS
+        Extracts the OAuth error code and description from a failed token request.
+
+    .DESCRIPTION
+        PowerShell 7 puts the response body on the error record's ErrorDetails;
+        Windows PowerShell leaves it on the response stream. A failure with neither
+        never reached the identity service at all, which the caller treats as a
+        transient network problem rather than a rejection.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter()]
+        [AllowNull()]
+        [object] $ErrorObject
+    )
+
+    $body = $null
+
+    if ($null -ne $ErrorObject) {
+        $details = Get-PimPropertyValue -InputObject $ErrorObject -Name 'ErrorDetails'
+        $message = Get-PimPropertyValue -InputObject $details -Name 'Message'
+        if (-not [string]::IsNullOrWhiteSpace($message)) {
+            try { $body = $message | ConvertFrom-Json } catch { $body = $null }
+        }
+
+        if ($null -eq $body) {
+            try {
+                $response = $ErrorObject.Exception.Response
+                if ($null -ne $response) {
+                    $stream = $response.GetResponseStream()
+                    $stream.Position = 0
+                    $text = ([System.IO.StreamReader]::new($stream)).ReadToEnd()
+                    if (-not [string]::IsNullOrWhiteSpace($text)) { $body = $text | ConvertFrom-Json }
+                }
+            }
+            catch { $body = $null }
+        }
+    }
+
+    [pscustomobject]@{
+        Code        = [string](Get-PimPropertyValue -InputObject $body -Name 'error')
+        Description = [string](Get-PimPropertyValue -InputObject $body -Name 'error_description')
+    }
+}
+
+function Request-PimDeviceCode {
+    <#
+    .SYNOPSIS
+        Asks the identity service for a device code the user can enter elsewhere.
+
+    .OUTPUTS
+        An object with DeviceCode, UserCode, VerificationUri, ExpiresInSeconds and
+        IntervalSeconds.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [string] $TenantId,
+
+        [Parameter(Mandatory)]
+        [string] $LoginBaseUri,
+
+        [Parameter(Mandatory)]
+        [string] $GraphBaseUri,
+
+        [Parameter(Mandatory)]
+        [string[]] $Scope,
+
+        [Parameter()]
+        [string] $ClientId = $script:GraphCommandLineClientId
+    )
+
+    Assert-PimGuid -Value $TenantId -ParameterName 'TenantId'
+
+    $authority = "$(Format-PimBaseUri -Uri $LoginBaseUri)/$TenantId/oauth2/v2.0"
+    $requested = ConvertTo-PimResourceScope -Scope $Scope -GraphBaseUri $GraphBaseUri
+
+    $response = Invoke-PimExternalCommand -Name 'Invoke-RestMethod' -Parameters @{
+        Method      = 'POST'
+        Uri         = "$authority/devicecode"
+        ContentType = 'application/x-www-form-urlencoded'
+        Body        = @{ client_id = $ClientId; scope = ($requested -join ' ') }
+        ErrorAction = 'Stop'
+    }
+
+    $userCode = [string](Get-PimPropertyValue -InputObject $response -Name 'user_code')
+    $deviceCode = [string](Get-PimPropertyValue -InputObject $response -Name 'device_code')
+
+    if ([string]::IsNullOrWhiteSpace($userCode) -or [string]::IsNullOrWhiteSpace($deviceCode)) {
+        throw 'The identity service did not return a device code. Check network connectivity and try again.'
+    }
+
+    $interval = Get-PimPropertyValue -InputObject $response -Name 'interval'
+    $expires = Get-PimPropertyValue -InputObject $response -Name 'expires_in'
+    $verification = [string](Get-PimPropertyValue -InputObject $response -Name 'verification_uri')
+    if ([string]::IsNullOrWhiteSpace($verification)) { $verification = 'https://microsoft.com/devicelogin' }
+
+    [pscustomobject]@{
+        DeviceCode       = $deviceCode
+        UserCode         = $userCode
+        VerificationUri  = $verification
+        ExpiresInSeconds = [int]$(if ($expires) { $expires } else { 900 })
+        # The service asks for 5s; polling faster earns a slow_down response.
+        IntervalSeconds  = [Math]::Max(5, [int]$(if ($interval) { $interval } else { 5 }))
+    }
+}
+
+function Wait-PimDeviceCodeToken {
+    <#
+    .SYNOPSIS
+        Polls the token endpoint until the user finishes signing in.
+
+    .DESCRIPTION
+        Stops when the code is redeemed, when the code lapses, or when the caller's
+        timeout runs out. A failure carrying no OAuth error body never reached the
+        identity service, so it is retried rather than discarding a code the user may
+        be part way through entering.
+
+    .OUTPUTS
+        The access token as a string.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [object] $DeviceCode,
+
+        [Parameter(Mandatory)]
+        [string] $TenantId,
+
+        [Parameter(Mandatory)]
+        [string] $LoginBaseUri,
+
+        [Parameter()]
+        [string] $ClientId = $script:GraphCommandLineClientId,
+
+        [Parameter()]
+        [int] $TimeoutSeconds = 900
+    )
+
+    Assert-PimGuid -Value $TenantId -ParameterName 'TenantId'
+
+    $authority = "$(Format-PimBaseUri -Uri $LoginBaseUri)/$TenantId/oauth2/v2.0"
+    $interval = [Math]::Max(5, [int]$DeviceCode.IntervalSeconds)
+    $deadline = (Get-Date).AddSeconds([Math]::Min($TimeoutSeconds, [int]$DeviceCode.ExpiresInSeconds))
+    $networkFailures = 0
+
+    while ((Get-Date) -lt $deadline) {
+        $null = Invoke-PimExternalCommand -Name 'Start-Sleep' -Parameters @{ Seconds = $interval }
+
+        try {
+            $token = Invoke-PimExternalCommand -Name 'Invoke-RestMethod' -Parameters @{
+                Method      = 'POST'
+                Uri         = "$authority/token"
+                ContentType = 'application/x-www-form-urlencoded'
+                Body        = @{
+                    grant_type  = 'urn:ietf:params:oauth:grant-type:device_code'
+                    client_id   = $ClientId
+                    device_code = $DeviceCode.DeviceCode
+                }
+                ErrorAction = 'Stop'
+            }
+
+            $accessToken = [string](Get-PimPropertyValue -InputObject $token -Name 'access_token')
+            if ([string]::IsNullOrWhiteSpace($accessToken)) {
+                throw 'The identity service accepted the device code but returned no access token.'
+            }
+
+            return $accessToken
+        }
+        catch {
+            $failure = $_
+            $oauth = Read-PimOAuthError -ErrorObject $failure
+
+            # Deliberately not a switch: break and continue inside a switch act on
+            # the switch rather than the enclosing loop, which would silently turn
+            # "keep waiting" into "stop waiting".
+            if ($oauth.Code -eq 'authorization_pending') {
+                $networkFailures = 0
+            }
+            elseif ($oauth.Code -eq 'slow_down') {
+                $interval += 5
+                $networkFailures = 0
+            }
+            elseif ($oauth.Code -eq 'expired_token' -or $oauth.Code -eq 'code_expired') {
+                throw 'The device code expired before it was used. Start the sign-in again.'
+            }
+            elseif ($oauth.Code -eq 'authorization_declined' -or $oauth.Code -eq 'access_denied') {
+                throw 'The sign-in was declined. Start the sign-in again to retry.'
+            }
+            elseif ($oauth.Code) {
+                throw "Device code sign-in failed: $($oauth.Code). $($oauth.Description)"
+            }
+            else {
+                $networkFailures++
+                if ($networkFailures -ge 20) {
+                    throw "Device code sign-in failed after $networkFailures consecutive network errors. $($failure.Exception.Message)"
+                }
+
+                Write-PimLog -Level Warning -Operation 'Connect-Graph' -TenantId $TenantId -Status 'PollFailed' `
+                    -Message "Could not reach the identity service ($networkFailures/20), still waiting. $($failure.Exception.Message)"
+            }
+        }
+    }
+
+    throw "No sign-in completed within $TimeoutSeconds seconds. Start the sign-in again when you are ready to enter the code."
+}
+
+function Connect-PimGraphWithDeviceCode {
+    <#
+    .SYNOPSIS
+        Signs in to Microsoft Graph with a device code the tool issues itself.
+
+    .DESCRIPTION
+        The Graph SDK's own -UseDeviceCode prints the code through the PowerShell
+        host, so it is invisible anywhere without one - notably the background
+        runspace the window does its work on. Running the device code flow directly
+        against the identity service means the code is ours to display, so it reaches
+        the user wherever they are. The resulting token is handed to Connect-MgGraph,
+        leaving every later call on the normal code path.
+
+    .OUTPUTS
+        The Microsoft Graph context.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [string] $TenantId,
+
+        [Parameter(Mandatory)]
+        [object] $CloudConfiguration,
+
+        [Parameter(Mandatory)]
+        [string[]] $Scope,
+
+        [Parameter()]
+        [int] $TimeoutSeconds = 900
+    )
+
+    $loginBaseUri = [string](Get-PimPropertyValue -InputObject $CloudConfiguration -Name 'LoginBaseUri')
+    if ([string]::IsNullOrWhiteSpace($loginBaseUri)) {
+        throw ("Cloud '$(Get-PimPropertyValue -InputObject $CloudConfiguration -Name 'DisplayName')' does not publish a sign-in endpoint, " +
+               'so a device code cannot be requested for it. Sign in with a browser instead.')
+    }
+
+    $code = Request-PimDeviceCode -TenantId $TenantId -LoginBaseUri $loginBaseUri `
+        -GraphBaseUri $CloudConfiguration.GraphBaseUri -Scope $Scope
+
+    # A warning rather than information because this is the one message the user has
+    # to act on, and it has to be visible in a console, in the window, and in a
+    # transcript without anyone having changed a preference variable first.
+    Write-Warning "To sign in, open $($code.VerificationUri) and enter the code $($code.UserCode)"
+    Write-PimLog -Operation 'Connect-Graph' -TenantId $TenantId -Status 'DeviceCodeIssued' `
+        -Message "Waiting for device code $($code.UserCode) to be entered at $($code.VerificationUri)."
+
+    $accessToken = Wait-PimDeviceCodeToken -DeviceCode $code -TenantId $TenantId -LoginBaseUri $loginBaseUri -TimeoutSeconds $TimeoutSeconds
+
+    $secureToken = ConvertTo-SecureString -String $accessToken -AsPlainText -Force
+
+    $null = Invoke-PimExternalCommand -Name 'Connect-MgGraph' -Parameters @{
+        AccessToken  = $secureToken
+        Environment  = $CloudConfiguration.GraphEnvironment
+        ContextScope = 'Process'
+        NoWelcome    = $true
+        ErrorAction  = 'Stop'
+    }
+
+    $context = Get-PimGraphContext
+    if ($null -eq $context) {
+        throw 'Microsoft Graph accepted the device code token but left no sign-in context.'
+    }
+
+    return $context
+}
+
 function Invoke-PimGraphSignIn {
     <#
     .SYNOPSIS
@@ -703,16 +1017,25 @@ function Invoke-PimGraphSignIn {
         user stays in control: the code is theirs to enter, and nothing is approved
         on their behalf.
 
+        The device code comes from the tool's own flow rather than the SDK's, so the
+        code is displayed through the normal streams and reaches the user whether
+        they are at a console or watching the window's activity log.
+
     .PARAMETER ConnectParameters
         Parameters to splat into Connect-MgGraph. Not modified; a copy is used.
+
+    .PARAMETER CloudConfiguration
+        Cloud record supplying the sign-in and Graph endpoints for the device code
+        flow. Without it no device code can be requested.
+
+    .PARAMETER Scope
+        Delegated scopes to request in the device code flow.
 
     .PARAMETER UseDeviceAuthentication
         Use a device code from the outset and do not attempt the broker at all.
 
-    .PARAMETER NoDeviceCode
-        Never use a device code. Set by callers running on a worker runspace, which
-        has no host for the Graph SDK to print a code to, so they fail with an
-        explanation instead of waiting forever for a code nobody can read.
+    .PARAMETER DeviceCodeTimeoutSeconds
+        How long to wait for the code to be entered.
 
     .OUTPUTS
         An object with Context and UsedDeviceCode.
@@ -724,61 +1047,64 @@ function Invoke-PimGraphSignIn {
         [hashtable] $ConnectParameters,
 
         [Parameter()]
+        [AllowNull()]
+        [object] $CloudConfiguration,
+
+        [Parameter()]
+        [AllowNull()]
+        [string[]] $Scope,
+
+        [Parameter()]
         [switch] $UseDeviceAuthentication,
 
         [Parameter()]
-        [switch] $NoDeviceCode
+        [int] $DeviceCodeTimeoutSeconds = 900
     )
 
-    if ($NoDeviceCode -and $UseDeviceAuthentication) {
-        throw $script:DeviceCodeUnavailableMessage
+    $tenantId = [string]$ConnectParameters['TenantId']
+
+    if (-not $Scope -and $ConnectParameters.ContainsKey('Scopes')) {
+        $Scope = [string[]]$ConnectParameters['Scopes']
+    }
+
+    $canUseDeviceCode = $null -ne $CloudConfiguration -and
+        -not [string]::IsNullOrWhiteSpace([string](Get-PimPropertyValue -InputObject $CloudConfiguration -Name 'LoginBaseUri'))
+
+    if ($UseDeviceAuthentication) {
+        if (-not $canUseDeviceCode) {
+            throw ('A device code sign-in was requested, but no sign-in endpoint is known for this cloud. ' +
+                   'Choose a different cloud or sign in with a browser.')
+        }
+
+        $context = Connect-PimGraphWithDeviceCode -TenantId $tenantId -CloudConfiguration $CloudConfiguration `
+            -Scope $Scope -TimeoutSeconds $DeviceCodeTimeoutSeconds
+
+        return [pscustomobject]@{ Context = $context; UsedDeviceCode = $true }
     }
 
     $broker = @{}
     foreach ($key in $ConnectParameters.Keys) { $broker[$key] = $ConnectParameters[$key] }
-    if ($UseDeviceAuthentication) { $broker['UseDeviceCode'] = $true }
 
     $null = Invoke-PimExternalCommand -Name 'Connect-MgGraph' -Parameters $broker
 
     $context = Get-PimGraphContext
     if ($null -ne $context) {
-        return [pscustomobject]@{
-            Context        = $context
-            UsedDeviceCode = [bool]$UseDeviceAuthentication
-        }
+        return [pscustomobject]@{ Context = $context; UsedDeviceCode = $false }
     }
 
-    if ($UseDeviceAuthentication) {
-        throw ('Microsoft Graph reported no error but left no sign-in context, even with device code ' +
-               'authentication. Make sure Microsoft.Graph.Authentication is up to date ' +
+    if (-not $canUseDeviceCode) {
+        throw ('Microsoft Graph reported no error but left no sign-in context, which means the sign-in broker ' +
+               'could not show a prompt. No sign-in endpoint is known for this cloud, so a device code cannot ' +
+               'be offered instead. Make sure Microsoft.Graph.Authentication is up to date ' +
                "(installed: $(Get-PimGraphAuthenticationVersion)).")
     }
 
-    if ($NoDeviceCode) {
-        # The Graph SDK prints the device code through the PowerShell host. A worker
-        # runspace has no host to print to, so going ahead would leave the user
-        # watching a progress bar for a code they will never be shown.
-        throw $script:DeviceCodeUnavailableMessage
-    }
-
-    Write-PimLog -Level Warning -Operation 'Connect-Graph' -Status 'BrokerUnavailable' `
+    Write-PimLog -Level Warning -Operation 'Connect-Graph' -TenantId $tenantId -Status 'BrokerUnavailable' `
         -Message ('Microsoft Graph reported no error but left no sign-in context, which means the ' +
                   'Web Account Manager broker could not show a sign-in prompt. Retrying with a device code.')
 
-    # Built fresh rather than by adding to the hashtable above, which was handed
-    # to the first call and must keep describing what that call actually asked for.
-    $deviceCode = @{}
-    foreach ($key in $ConnectParameters.Keys) { $deviceCode[$key] = $ConnectParameters[$key] }
-    $deviceCode['UseDeviceCode'] = $true
-
-    $null = Invoke-PimExternalCommand -Name 'Connect-MgGraph' -Parameters $deviceCode
-
-    $context = Get-PimGraphContext
-    if ($null -eq $context) {
-        throw ('Microsoft Graph reported no error but left no sign-in context, with or without a device code. ' +
-               'Make sure Microsoft.Graph.Authentication is up to date ' +
-               "(installed: $(Get-PimGraphAuthenticationVersion)).")
-    }
+    $context = Connect-PimGraphWithDeviceCode -TenantId $tenantId -CloudConfiguration $CloudConfiguration `
+        -Scope $Scope -TimeoutSeconds $DeviceCodeTimeoutSeconds
 
     [pscustomobject]@{
         Context        = $context
@@ -797,9 +1123,8 @@ function Connect-PimGraphTenant {
         call. When the full scope set cannot be consented, the connection is retried
         with the minimum scope set and the result reports reduced functionality.
 
-    .PARAMETER NoDeviceCode
-        Never use a device code. Set by callers running on a worker runspace, which
-        has no host for the Graph SDK to print a code to.
+    .PARAMETER DeviceCodeTimeoutSeconds
+        How long to wait for a device code to be entered, when one is used.
 
     .OUTPUTS
         pscustomobject with Success, TenantId, Environment, Account, Scopes,
@@ -830,7 +1155,7 @@ function Connect-PimGraphTenant {
         [switch] $UseDeviceAuthentication,
 
         [Parameter()]
-        [switch] $NoDeviceCode,
+        [int] $DeviceCodeTimeoutSeconds = 900,
 
         [Parameter()]
         [AllowNull()]
@@ -885,7 +1210,6 @@ function Connect-PimGraphTenant {
                 NoWelcome    = $true
                 ErrorAction  = 'Stop'
             }
-            if ($UseDeviceAuthentication) { $connectParameters['UseDeviceCode'] = $true }
 
             # Ask for the account we already signed in to Azure with, so the broker
             # does not quietly satisfy this from a different cached account.
@@ -896,8 +1220,10 @@ function Connect-PimGraphTenant {
             # Once the broker has proven unusable there is no point letting a later
             # attempt fail the same way, so stay on device code for the rest of the run.
             $signIn = Invoke-PimGraphSignIn -ConnectParameters $connectParameters `
-                -UseDeviceAuthentication:($UseDeviceAuthentication -or $brokerUnusable) `
-                -NoDeviceCode:$NoDeviceCode
+                -CloudConfiguration $CloudConfiguration `
+                -Scope ([string[]]$attempt.Scopes) `
+                -DeviceCodeTimeoutSeconds $DeviceCodeTimeoutSeconds `
+                -UseDeviceAuthentication:($UseDeviceAuthentication -or $brokerUnusable)
             if ($signIn.UsedDeviceCode) { $brokerUnusable = $true }
             $context = $signIn.Context
 
@@ -1758,6 +2084,11 @@ function Get-PimActiveGroupAssignment {
 
 Export-ModuleMember -Function @(
     'Invoke-PimGraphSignIn'
+    'ConvertTo-PimResourceScope'
+    'Read-PimOAuthError'
+    'Request-PimDeviceCode'
+    'Wait-PimDeviceCodeToken'
+    'Connect-PimGraphWithDeviceCode'
     'Get-PimDefaultGraphScope'
     'Get-PimMinimumGraphScope'
     'Set-PimCommandOverride'

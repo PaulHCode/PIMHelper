@@ -22,6 +22,7 @@ $script:BuiltInCloudConfiguration = @(
         AzEnvironment    = 'AzureCloud'
         GraphEnvironment = 'Global'
         GraphBaseUri     = 'https://graph.microsoft.com'
+        LoginBaseUri     = 'https://login.microsoftonline.com'
         IsBuiltIn        = $true
         IsSupported      = $true
         UnsupportedReason = $null
@@ -31,6 +32,7 @@ $script:BuiltInCloudConfiguration = @(
         AzEnvironment    = 'AzureUSGovernment'
         GraphEnvironment = 'USGov'
         GraphBaseUri     = 'https://graph.microsoft.us'
+        LoginBaseUri     = 'https://login.microsoftonline.us'
         IsBuiltIn        = $true
         IsSupported      = $true
         UnsupportedReason = $null
@@ -40,6 +42,7 @@ $script:BuiltInCloudConfiguration = @(
         AzEnvironment    = 'AzureUSGovernment'
         GraphEnvironment = 'USGovDoD'
         GraphBaseUri     = 'https://dod-graph.microsoft.us'
+        LoginBaseUri     = 'https://login.microsoftonline.us'
         IsBuiltIn        = $true
         IsSupported      = $true
         UnsupportedReason = $null
@@ -70,6 +73,7 @@ function Get-PimBuiltInCloudConfiguration {
             AzEnvironment     = $cloud.AzEnvironment
             GraphEnvironment  = $cloud.GraphEnvironment
             GraphBaseUri      = $cloud.GraphBaseUri
+            LoginBaseUri      = $cloud.LoginBaseUri
             IsBuiltIn         = $cloud.IsBuiltIn
             IsSupported       = $cloud.IsSupported
             UnsupportedReason = $cloud.UnsupportedReason
@@ -236,11 +240,20 @@ function New-PimCustomCloudConfiguration {
         }
     }
 
+    # Only the tool's own device code flow needs this, so a missing or unusable
+    # authority costs that one sign-in method rather than the whole environment.
+    $loginBaseUri = $null
+    $authority = Get-PimPropertyValue -InputObject $AzEnvironment -Name 'ActiveDirectoryAuthority'
+    if (-not [string]::IsNullOrWhiteSpace($authority)) {
+        try { $loginBaseUri = Format-PimBaseUri -Uri $authority } catch { $loginBaseUri = $null }
+    }
+
     [pscustomobject]@{
         DisplayName       = "Custom: $azName"
         AzEnvironment     = $azName
         GraphEnvironment  = $graphName
         GraphBaseUri      = $normalizedBaseUri
+        LoginBaseUri      = $loginBaseUri
         IsBuiltIn         = $false
         IsSupported       = [bool]([string]::IsNullOrWhiteSpace($reason))
         UnsupportedReason = $reason

@@ -444,13 +444,225 @@ Describe 'Test-PimGraphIdentity' {
     }
 }
 
+Describe 'ConvertTo-PimResourceScope' {
+    It 'qualifies bare scope names with the Graph resource' {
+        $scopes = ConvertTo-PimResourceScope -Scope @('Group.Read.All') -GraphBaseUri 'https://graph.microsoft.com'
+        $scopes[0] | Should -Be 'https://graph.microsoft.com/Group.Read.All'
+    }
+
+    It 'uses the cloud it was given rather than a hard-coded host' {
+        $scopes = ConvertTo-PimResourceScope -Scope @('User.Read') -GraphBaseUri 'https://dod-graph.microsoft.us'
+        $scopes[0] | Should -Be 'https://dod-graph.microsoft.us/User.Read'
+    }
+
+    It 'leaves OpenID scopes alone' {
+        # These address the identity service, not a resource, and qualifying them
+        # makes the whole request invalid.
+        $scopes = ConvertTo-PimResourceScope -Scope @('offline_access', 'openid') -GraphBaseUri 'https://graph.microsoft.com'
+        $scopes | Should -Be @('offline_access', 'openid')
+    }
+
+    It 'leaves an already qualified scope alone' {
+        $scopes = ConvertTo-PimResourceScope -Scope @('https://graph.microsoft.com/User.Read') -GraphBaseUri 'https://graph.microsoft.com'
+        $scopes[0] | Should -Be 'https://graph.microsoft.com/User.Read'
+    }
+}
+
+Describe 'Read-PimOAuthError' {
+    It 'reads the error code out of the response body' {
+        $failure = [System.Management.Automation.ErrorRecord]::new(
+            [System.Exception]::new('Bad Request'), 'OAuthError', 'ProtocolError', $null)
+        $failure.ErrorDetails = [System.Management.Automation.ErrorDetails]::new(
+            '{"error":"authorization_pending","error_description":"still waiting"}')
+
+        $oauth = Read-PimOAuthError -ErrorObject $failure
+
+        $oauth.Code        | Should -Be 'authorization_pending'
+        $oauth.Description | Should -Be 'still waiting'
+    }
+
+    It 'reports no code when the request never reached the identity service' {
+        # A connection failure carries no OAuth body, and the caller has to tell
+        # that apart from a rejection so it keeps polling instead of giving up.
+        $failure = [System.Management.Automation.ErrorRecord]::new(
+            [System.Exception]::new('No such host is known'), 'NameResolution', 'ConnectionError', $null)
+
+        $oauth = Read-PimOAuthError -ErrorObject $failure
+
+        $oauth.Code | Should -BeNullOrEmpty
+    }
+
+    It 'survives a body that is not JSON' {
+        $failure = [System.Management.Automation.ErrorRecord]::new(
+            [System.Exception]::new('Gateway Timeout'), 'Proxy', 'ProtocolError', $null)
+        $failure.ErrorDetails = [System.Management.Automation.ErrorDetails]::new('<html>proxy error</html>')
+
+        { Read-PimOAuthError -ErrorObject $failure } | Should -Not -Throw
+    }
+}
+
+Describe 'Request-PimDeviceCode' {
+    It 'rejects a tenant id that is not a GUID' {
+        # The value lands in a URL, so it is validated before being sent anywhere.
+        { Request-PimDeviceCode -TenantId 'contoso.com/../evil' -LoginBaseUri 'https://login.microsoftonline.com' `
+            -GraphBaseUri 'https://graph.microsoft.com' -Scope @('User.Read') } | Should -Throw
+    }
+
+    It 'fails loudly when no code comes back' {
+        Set-PimCommandOverride -Name 'Invoke-RestMethod' -Handler { param($p) [pscustomobject]@{ error = 'invalid_client' } }
+
+        { Request-PimDeviceCode -TenantId '11111111-1111-1111-1111-111111111111' `
+            -LoginBaseUri 'https://login.microsoftonline.com' -GraphBaseUri 'https://graph.microsoft.com' `
+            -Scope @('User.Read') } | Should -Throw '*did not return a device code*'
+    }
+
+    It 'never polls faster than the service allows' {
+        Set-PimCommandOverride -Name 'Invoke-RestMethod' -Handler { param($p)
+            [pscustomobject]@{ device_code = 'd'; user_code = 'u'; verification_uri = 'https://example.com'; expires_in = 900; interval = 1 }
+        }
+
+        $code = Request-PimDeviceCode -TenantId '11111111-1111-1111-1111-111111111111' `
+            -LoginBaseUri 'https://login.microsoftonline.com' -GraphBaseUri 'https://graph.microsoft.com' -Scope @('User.Read')
+
+        $code.IntervalSeconds | Should -BeGreaterOrEqual 5
+    }
+}
+
+Describe 'Wait-PimDeviceCodeToken' {
+    It 'backs off when the service says to slow down' {
+        $script:Slept = @()
+        $script:Attempt = 0
+        Set-PimCommandOverride -Name 'Start-Sleep' -Handler { param($p) $script:Slept += $p['Seconds'] }
+        Set-PimCommandOverride -Name 'Invoke-RestMethod' -Handler { param($p)
+            $script:Attempt++
+            if ($script:Attempt -eq 1) {
+                $failure = [System.Management.Automation.ErrorRecord]::new(
+                    [System.Exception]::new('Bad Request'), 'OAuthError', 'ProtocolError', $null)
+                $failure.ErrorDetails = [System.Management.Automation.ErrorDetails]::new('{"error":"slow_down"}')
+                throw $failure
+            }
+            [pscustomobject]@{ access_token = 'token-value' }
+        }
+
+        $code = [pscustomobject]@{ DeviceCode = 'd'; IntervalSeconds = 5; ExpiresInSeconds = 900 }
+        $token = Wait-PimDeviceCodeToken -DeviceCode $code -TenantId '11111111-1111-1111-1111-111111111111' `
+            -LoginBaseUri 'https://login.microsoftonline.com'
+
+        $token | Should -Be 'token-value'
+        $script:Slept[1] | Should -BeGreaterThan $script:Slept[0]
+    }
+
+    It 'keeps polling through a network blip rather than discarding the code' {
+        # The user may be part way through signing in; a dropped connection is no
+        # reason to make them start over with a fresh code.
+        $script:Attempt = 0
+        Set-PimCommandOverride -Name 'Start-Sleep' -Handler { param($p) }
+        Set-PimCommandOverride -Name 'Invoke-RestMethod' -Handler { param($p)
+            $script:Attempt++
+            if ($script:Attempt -lt 3) { throw 'The remote name could not be resolved' }
+            [pscustomobject]@{ access_token = 'token-value' }
+        }
+
+        $code = [pscustomobject]@{ DeviceCode = 'd'; IntervalSeconds = 5; ExpiresInSeconds = 900 }
+        $token = Wait-PimDeviceCodeToken -DeviceCode $code -TenantId '11111111-1111-1111-1111-111111111111' `
+            -LoginBaseUri 'https://login.microsoftonline.com'
+
+        $token | Should -Be 'token-value'
+        $script:Attempt | Should -Be 3
+    }
+
+    It 'stops polling once the network has clearly gone' {
+        Set-PimCommandOverride -Name 'Start-Sleep' -Handler { param($p) }
+        Set-PimCommandOverride -Name 'Invoke-RestMethod' -Handler { param($p) throw 'The remote name could not be resolved' }
+
+        $code = [pscustomobject]@{ DeviceCode = 'd'; IntervalSeconds = 5; ExpiresInSeconds = 900 }
+
+        { Wait-PimDeviceCodeToken -DeviceCode $code -TenantId '11111111-1111-1111-1111-111111111111' `
+            -LoginBaseUri 'https://login.microsoftonline.com' } | Should -Throw '*consecutive network errors*'
+    }
+
+    It 'gives up when the user declines' {
+        Set-PimCommandOverride -Name 'Start-Sleep' -Handler { param($p) }
+        Set-PimCommandOverride -Name 'Invoke-RestMethod' -Handler { param($p)
+            $failure = [System.Management.Automation.ErrorRecord]::new(
+                [System.Exception]::new('Bad Request'), 'OAuthError', 'ProtocolError', $null)
+            $failure.ErrorDetails = [System.Management.Automation.ErrorDetails]::new('{"error":"authorization_declined"}')
+            throw $failure
+        }
+
+        $code = [pscustomobject]@{ DeviceCode = 'd'; IntervalSeconds = 5; ExpiresInSeconds = 900 }
+
+        { Wait-PimDeviceCodeToken -DeviceCode $code -TenantId '11111111-1111-1111-1111-111111111111' `
+            -LoginBaseUri 'https://login.microsoftonline.com' } | Should -Throw '*declined*'
+    }
+
+    It 'stops waiting once the caller''s budget runs out' {
+        Set-PimCommandOverride -Name 'Start-Sleep' -Handler { param($p) }
+
+        $code = [pscustomobject]@{ DeviceCode = 'd'; IntervalSeconds = 5; ExpiresInSeconds = 0 }
+
+        { Wait-PimDeviceCodeToken -DeviceCode $code -TenantId '11111111-1111-1111-1111-111111111111' `
+            -LoginBaseUri 'https://login.microsoftonline.com' -TimeoutSeconds 0 } | Should -Throw '*No sign-in completed*'
+    }
+}
+
 Describe 'Connect-PimGraphTenant' {
+    BeforeAll {
+        # The tool runs the device code flow itself, so these fakes stand in for the
+        # identity service rather than for the SDK's own device code support.
+        function Set-PimFakeDeviceCodeFlow {
+            param(
+                [string[]] $PollResponses = @('granted'),
+                [string]   $UserCode = 'ABC123XYZ'
+            )
+
+            $script:RestCalls = @()
+            $script:PollIndex = 0
+            $script:SleepSeconds = @()
+            # Handlers run long after this function returns, and PowerShell
+            # scriptblocks are not closures, so everything they read has to live
+            # in script scope rather than in these parameters.
+            $script:FakePollResponses = $PollResponses
+            $script:FakeUserCode = $UserCode
+
+            Set-PimCommandOverride -Name 'Start-Sleep' -Handler { param($p) $script:SleepSeconds += $p['Seconds'] }
+            Set-PimCommandOverride -Name 'Invoke-RestMethod' -Handler { param($p)
+                $script:RestCalls += , $p
+
+                if ($p['Uri'] -like '*/devicecode') {
+                    return [pscustomobject]@{
+                        device_code      = 'device-code-value'
+                        user_code        = $script:FakeUserCode
+                        verification_uri = 'https://microsoft.com/devicelogin'
+                        expires_in       = 900
+                        interval         = 5
+                    }
+                }
+
+                $outcome = $script:FakePollResponses[[Math]::Min($script:PollIndex, $script:FakePollResponses.Count - 1)]
+                $script:PollIndex++
+
+                if ($outcome -eq 'granted') {
+                    return [pscustomobject]@{ access_token = 'token-value'; expires_in = 3600 }
+                }
+
+                # The identity service signals everything else through an error body.
+                $failure = [System.Management.Automation.ErrorRecord]::new(
+                    [System.Exception]::new('Bad Request'), 'OAuthError', 'ProtocolError', $null)
+                $failure.ErrorDetails = [System.Management.Automation.ErrorDetails]::new(
+                    (@{ error = $outcome; error_description = "simulated $outcome" } | ConvertTo-Json -Compress))
+                throw $failure
+            }
+        }
+    }
+
     It 'falls back to a device code when the broker will not show a prompt' {
         # Observed live: the WAM broker can fail to prompt and Connect-MgGraph
         # returns without raising anything, leaving Get-MgContext null. A device
         # code needs no window, so retrying with one gets the user signed in
         # instead of making them discover the workaround and start over.
         $script:ConnectCalls = @()
+        Set-PimFakeDeviceCodeFlow
         Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) $script:ConnectCalls += , $p }
         Set-PimCommandOverride -Name 'Get-MgContext' -Handler { param($p)
             if ($script:ConnectCalls.Count -lt 2) { return $null }
@@ -461,60 +673,111 @@ Describe 'Connect-PimGraphTenant' {
 
         $result.Success | Should -BeTrue
         $script:ConnectCalls.Count | Should -Be 2
-        $script:ConnectCalls[0].ContainsKey('UseDeviceCode') | Should -BeFalse -Because 'the broker is tried first'
-        $script:ConnectCalls[1]['UseDeviceCode'] | Should -BeTrue
+        $script:ConnectCalls[0].ContainsKey('AccessToken') | Should -BeFalse -Because 'the broker is tried first'
+        $script:ConnectCalls[1].ContainsKey('AccessToken') | Should -BeTrue -Because 'the fallback signs in with the token we obtained'
+    }
+
+    It 'shows the user the code it is waiting on' {
+        # The whole point of owning the flow: the SDK prints the code through the
+        # PowerShell host, which a worker runspace does not have, so the window
+        # could never display it. A warning reaches a console and the window alike.
+        Set-PimFakeDeviceCodeFlow -UserCode 'QRST12345'
+        Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) }
+        Set-PimCommandOverride -Name 'Get-MgContext' -Handler { param($p)
+            [pscustomobject]@{ TenantId = '11111111-1111-1111-1111-111111111111'; Environment = 'Global'; Account = 'ada@contoso.com'; Scopes = (Get-PimMinimumGraphScope) }
+        }
+
+        $null = Connect-PimGraphTenant -TenantId $script:TenantId -CloudConfiguration $script:CommercialCloud `
+            -Force -UseDeviceAuthentication -WarningVariable warnings -WarningAction SilentlyContinue
+
+        ($warnings -join ' ') | Should -Match 'QRST12345'
+        ($warnings -join ' ') | Should -Match 'devicelogin'
+    }
+
+    It 'asks the identity service for the scopes it actually needs' {
+        Set-PimFakeDeviceCodeFlow
+        Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) }
+        Set-PimCommandOverride -Name 'Get-MgContext' -Handler { param($p)
+            [pscustomobject]@{ TenantId = '11111111-1111-1111-1111-111111111111'; Environment = 'Global'; Account = 'ada@contoso.com'; Scopes = (Get-PimMinimumGraphScope) }
+        }
+
+        $null = Connect-PimGraphTenant -TenantId $script:TenantId -CloudConfiguration $script:CommercialCloud `
+            -Force -UseDeviceAuthentication -WarningAction SilentlyContinue
+
+        $request = @($script:RestCalls | Where-Object { $_['Uri'] -like '*/devicecode' })[0]
+        $request['Uri'] | Should -Be "https://login.microsoftonline.com/$($script:TenantId)/oauth2/v2.0/devicecode"
+        # The token endpoint has no default resource, so bare scope names would be rejected.
+        $request['Body']['scope'] | Should -Match 'https://graph\.microsoft\.com/PrivilegedAssignmentSchedule\.ReadWrite\.AzureADGroup'
     }
 
     It 'goes straight to a device code when one was asked for' {
         $script:ConnectCalls = @()
+        Set-PimFakeDeviceCodeFlow
         Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) $script:ConnectCalls += , $p }
         Set-PimCommandOverride -Name 'Get-MgContext' -Handler { param($p)
             [pscustomobject]@{ TenantId = '11111111-1111-1111-1111-111111111111'; Environment = 'Global'; Account = 'ada@contoso.com'; Scopes = (Get-PimMinimumGraphScope) }
         }
 
         $null = Connect-PimGraphTenant -TenantId $script:TenantId -CloudConfiguration $script:CommercialCloud `
-            -Force -UseDeviceAuthentication
+            -Force -UseDeviceAuthentication -WarningAction SilentlyContinue
 
         $script:ConnectCalls.Count | Should -Be 1 -Because 'the broker is known to be unusable'
-        $script:ConnectCalls[0]['UseDeviceCode'] | Should -BeTrue
+        $script:ConnectCalls[0].ContainsKey('AccessToken') | Should -BeTrue
     }
 
-    It 'explains itself instead of waiting for a code nobody can read' {
-        # A worker runspace has no host, so the SDK's device code goes nowhere.
-        # Falling back there would hang the window on a code the user never sees.
-        $script:ConnectCalls = @()
-        Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) $script:ConnectCalls += , $p }
+    It 'keeps waiting while the user is still entering the code' {
+        Set-PimFakeDeviceCodeFlow -PollResponses @('authorization_pending', 'authorization_pending', 'granted')
+        Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) }
+        Set-PimCommandOverride -Name 'Get-MgContext' -Handler { param($p)
+            [pscustomobject]@{ TenantId = '11111111-1111-1111-1111-111111111111'; Environment = 'Global'; Account = 'ada@contoso.com'; Scopes = (Get-PimMinimumGraphScope) }
+        }
+
+        $result = Connect-PimGraphTenant -TenantId $script:TenantId -CloudConfiguration $script:CommercialCloud `
+            -Force -UseDeviceAuthentication -WarningAction SilentlyContinue
+
+        $result.Success | Should -BeTrue
+        @($script:RestCalls | Where-Object { $_['Uri'] -like '*/token' }).Count | Should -Be 3
+    }
+
+    It 'gives up when the code lapses before anyone uses it' {
+        Set-PimFakeDeviceCodeFlow -PollResponses @('expired_token')
+        Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) }
         Set-PimCommandOverride -Name 'Get-MgContext' -Handler { param($p) $null }
 
         $result = Connect-PimGraphTenant -TenantId $script:TenantId -CloudConfiguration $script:CommercialCloud `
-            -Force -NoDeviceCode
+            -Force -UseDeviceAuthentication -WarningAction SilentlyContinue
 
         $result.Success | Should -BeFalse
-        $result.Detail  | Should -Match 'no way to show you one'
-        $result.Detail  | Should -Match 'UseDeviceAuthentication'
-        @($script:ConnectCalls | Where-Object { $_.ContainsKey('UseDeviceCode') }).Count |
-            Should -Be 0 -Because 'a code that cannot be displayed must never be requested'
+        $result.Detail  | Should -Match 'expired'
     }
 
-    It 'refuses an explicit device code request it cannot display' {
-        Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) throw 'Should not have tried to sign in.' }
+    It 'says so when no sign-in endpoint is known for the cloud' {
+        Set-PimFakeDeviceCodeFlow
+        Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) }
+        Set-PimCommandOverride -Name 'Get-MgContext' -Handler { param($p) $null }
 
-        $result = Connect-PimGraphTenant -TenantId $script:TenantId -CloudConfiguration $script:CommercialCloud `
-            -Force -NoDeviceCode -UseDeviceAuthentication
+        $cloud = [pscustomobject]@{
+            DisplayName = 'Custom: Nowhere'; GraphEnvironment = 'Global'
+            GraphBaseUri = 'https://graph.microsoft.com'; LoginBaseUri = $null
+        }
+
+        $result = Connect-PimGraphTenant -TenantId $script:TenantId -CloudConfiguration $cloud -Force
 
         $result.Success | Should -BeFalse
-        $result.Detail  | Should -Match 'no way to show you one'
+        $result.Detail  | Should -Match 'no sign-in endpoint is known'
+        @($script:RestCalls).Count | Should -Be 0 -Because 'there is nowhere to send a device code request'
     }
 
-    It 'reports an actionable error when even a device code leaves no context' {        Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) }
+    It 'reports an actionable error when the broker leaves no context' {
+        Set-PimFakeDeviceCodeFlow
+        Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) }
         Set-PimCommandOverride -Name 'Get-MgContext' -Handler { param($p) $null }
         Set-PimCommandOverride -Name 'Get-Module' -Handler { param($p) [pscustomobject]@{ Version = [version]'2.25.0' } }
 
         $result = Connect-PimGraphTenant -TenantId $script:TenantId -CloudConfiguration $script:CommercialCloud -Force
 
         $result.Success | Should -BeFalse
-        $result.Detail  | Should -Match 'device code'
-        $result.Detail  | Should -Match '2\.25\.0'
+        $result.Detail  | Should -Match 'left no sign-in context'
     }
 
     It 'warns but does not lock out when the names cannot be reconciled' {

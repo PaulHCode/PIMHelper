@@ -327,7 +327,7 @@ $script:LoadGroupsWorker = {
         $Shared.Status = "Connecting to $($tenant.TenantDisplayName) ($index of $($Tenants.Count))..."
         Write-Information "Connecting to $($tenant.TenantDisplayName) [$($tenant.TenantId)]..."
 
-        $connection = Connect-PimGraphTenant -TenantId $tenant.TenantId -CloudConfiguration $CloudConfiguration -UseDeviceAuthentication:([bool]$UseDeviceCode) -NoDeviceCode -ExpectedAccount $ExpectedAccount
+        $connection = Connect-PimGraphTenant -TenantId $tenant.TenantId -CloudConfiguration $CloudConfiguration -UseDeviceAuthentication:([bool]$UseDeviceCode) -ExpectedAccount $ExpectedAccount
 
         if (-not $connection.Success) {
             Write-Warning "$($tenant.TenantDisplayName): $($connection.Message)"
@@ -439,7 +439,7 @@ $script:SubmitWorker = {
         $Shared.Status = "Connecting to $tenantName..."
         Write-Information "Connecting to $tenantName [$tenantId]..."
 
-        $connection = Connect-PimGraphTenant -TenantId $tenantId -CloudConfiguration $CloudConfiguration -UseDeviceAuthentication:([bool]$UseDeviceCode) -NoDeviceCode -ExpectedAccount $ExpectedAccount
+        $connection = Connect-PimGraphTenant -TenantId $tenantId -CloudConfiguration $CloudConfiguration -UseDeviceAuthentication:([bool]$UseDeviceCode) -ExpectedAccount $ExpectedAccount
 
         if (-not $connection.Success) {
             Write-Warning "$tenantName`: $($connection.Message)"
