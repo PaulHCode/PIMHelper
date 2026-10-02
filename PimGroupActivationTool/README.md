@@ -197,24 +197,34 @@ should work regardless, but if a specific group fails this way, activate it from
 Entra portal once and report the group type.
 
 **"Microsoft Graph signed in as … but Azure is signed in as …"**
-Every Graph session is checked against the account you signed in to Azure with, both
-when an existing session is reused and immediately after a new sign-in. Signing in
-again is not proof of *who* you signed in as: the WAM broker can satisfy a sign-in
-from a cached account without ever prompting. Sign out of the other account, or
-restart the tool and pick the matching one.
+A warning, not a failure. Every Graph session is checked against the account you
+signed in to Azure with, both when an existing session is reused and immediately
+after a new sign-in — signing in again is not proof of *who* you signed in as,
+because the WAM broker can satisfy a sign-in from a cached account without ever
+prompting. If the two names are not the same person, close the tool and sign in
+again before activating anything.
 
-The comparison is by home identity, not by literal text, because Azure reports your
-home UPN (`ada@contoso.com`) while Graph reports the B2B form in a tenant you guest
-into (`ada_contoso.com#EXT#@fabrikam.onmicrosoft.com`). Both resolve to the same
-person. If Graph reports no account at all — which happens when the session was
-created from a caller-supplied access token — the tool asks Graph who it is rather
-than letting the blank value pass.
+It is a warning rather than a hard stop because the two names can differ for one
+legitimate person. A B2B guest's user principal name is minted from the address
+the invitation was sent to, so Graph reports
+`ada.lovelace_contoso.com#EXT#@fabrikam.onmicrosoft.com` while Azure reports
+whatever your UPN is. Wherever an organisation's UPN differs from its primary
+mail address those two strings cannot be reconciled locally, and refusing would
+block exactly the cross-tenant case this tool exists for. The tool therefore
+compares your Azure account against every name Graph knows you by — the folded
+guest UPN, your `mail`, and your `otherMails` — and only warns when none match.
 
-*Known limitation:* the check binds to the user principal name, which is mutable and
-re-assignable by an administrator. A durable binding would use the MSAL
-`HomeAccountId`, which is not available across all supported module versions. Within
-a single run of the tool the practical risk is negligible, but the check is a
-safeguard against an account switch, not an authentication boundary.
+**"Microsoft Graph connected but would not say which account the session belongs to"**
+This *is* a failure. Graph accepted the sign-in but would not return your profile,
+so the tool has no evidence of who it is acting as. Since the same profile read
+supplies the principal ID that every PIM call needs, nothing could have worked
+anyway. Sign in again, and check that the tenant allows guests to read their own
+profile.
+
+*Known limitation:* the check binds to names, which an administrator can
+reassign. A durable binding would use the MSAL `HomeAccountId`, which is not
+available across all supported module versions. The check is a safeguard against
+an accidental account switch, not an authentication boundary.
 
 **Activation succeeds but access does not work**
 Group-based access is evaluated at token issue time. Sign out and back in to the

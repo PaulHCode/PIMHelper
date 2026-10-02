@@ -532,19 +532,27 @@ function Test-PimGraphContext {
 function Resolve-PimContextAccount {
     <#
     .SYNOPSIS
-        Returns the account a Microsoft Graph context is actually signed in as.
+        Returns every name the Microsoft Graph session is known by.
 
     .DESCRIPTION
-        Get-MgContext usually reports the account, but a context built from a
+        Get-MgContext usually reports an account, but a context built from a
         caller-supplied access token populates Scopes and leaves Account empty.
         Trusting that blank value would let any token pass an identity check, so
         the real principal is read from Graph instead.
 
-        Returns an empty string when the principal cannot be established, which
+        More than one name is returned because no single property is guaranteed to
+        spell the account the way Azure does. In a guest tenant the UPN is minted
+        from the invited address, which is the mail address rather than the UPN
+        wherever the two differ.
+
+        Returns an empty set when the principal cannot be established, which
         callers must treat as a failed check rather than a pass.
+
+    .OUTPUTS
+        [string[]] of candidate account names, possibly empty.
     #>
     [CmdletBinding()]
-    [OutputType([string])]
+    [OutputType([string[]])]
     param(
         [Parameter()]
         [AllowNull()]
@@ -554,19 +562,93 @@ function Resolve-PimContextAccount {
         [string] $GraphBaseUri
     )
 
-    if ($null -eq $Context) { return '' }
+    $candidates = [System.Collections.Generic.List[string]]::new()
 
-    $account = [string](Get-PimPropertyValue -InputObject $Context -Name 'Account')
-    if (-not [string]::IsNullOrWhiteSpace($account)) { return $account }
+    if ($null -ne $Context) {
+        $account = [string](Get-PimPropertyValue -InputObject $Context -Name 'Account')
+        if (-not [string]::IsNullOrWhiteSpace($account)) { $candidates.Add($account) }
+    }
 
     try {
         $me = Get-CurrentGraphUser -GraphBaseUri $GraphBaseUri
-        return [string]$me.UserPrincipalName
+        foreach ($name in @($me.UserPrincipalName, $me.Mail)) {
+            if (-not [string]::IsNullOrWhiteSpace($name)) { $candidates.Add([string]$name) }
+        }
+        foreach ($name in @($me.OtherMails)) {
+            if (-not [string]::IsNullOrWhiteSpace($name)) { $candidates.Add([string]$name) }
+        }
     }
     catch {
-        Write-PimLog -Level Warning -Operation 'Connect-Graph' -Status 'Failed' `
-            -Message "Could not establish which account the Microsoft Graph session belongs to: $(ConvertTo-PimErrorText -ErrorObject $_)"
-        return ''
+        # Only a problem when the context named nobody; otherwise the context
+        # account stands on its own and the extra spellings are a convenience.
+        if ($candidates.Count -eq 0) {
+            Write-PimLog -Level Warning -Operation 'Connect-Graph' -Status 'Failed' `
+                -Message "Could not establish which account the Microsoft Graph session belongs to: $(ConvertTo-PimErrorText -ErrorObject $_)"
+        }
+    }
+
+    # Returned without a leading comma so that @(...) at the call sites yields a
+    # flat list; wrapping a comma-returned array in @() nests it instead. The
+    # @() around Select-Object keeps the empty case an empty array rather than a
+    # single null, which @() at the call site would count as one candidate.
+    $unique = @($candidates | Select-Object -Unique)
+    return [string[]]$unique
+}
+
+function Test-PimGraphIdentity {
+    <#
+    .SYNOPSIS
+        Decides whether a Microsoft Graph session belongs to the expected person.
+
+    .DESCRIPTION
+        Checks the name the context already reports first, so the common case
+        costs nothing. Only when that name does not match does it ask Graph for
+        the account's other spellings, because a guest UPN is minted from the
+        invited address and may legitimately differ from the Azure UPN.
+
+    .OUTPUTS
+        pscustomobject with:
+          Matched    - $true when a candidate matched, or nothing was expected.
+          Identified - $false only when no name for the session could be found.
+          Account    - the best name to show the user, or '' when unidentified.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter()]
+        [AllowNull()]
+        [object] $Context,
+
+        [Parameter()]
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $ExpectedAccount,
+
+        [Parameter(Mandatory)]
+        [string] $GraphBaseUri
+    )
+
+    $contextAccount = ''
+    if ($null -ne $Context) {
+        $contextAccount = [string](Get-PimPropertyValue -InputObject $Context -Name 'Account')
+    }
+
+    if ([string]::IsNullOrWhiteSpace($ExpectedAccount)) {
+        return ([pscustomobject]@{ Matched = $true; Identified = $true; Account = $contextAccount })
+    }
+
+    if (Test-PimAccountMatch -Expected $ExpectedAccount -Actual @($contextAccount)) {
+        return ([pscustomobject]@{ Matched = $true; Identified = $true; Account = $contextAccount })
+    }
+
+    $candidates = @(Resolve-PimContextAccount -Context $Context -GraphBaseUri $GraphBaseUri)
+    $account = ''
+    if ($candidates.Count -gt 0) { $account = [string]$candidates[0] }
+
+    [pscustomobject]@{
+        Matched    = (Test-PimAccountMatch -Expected $ExpectedAccount -Actual $candidates)
+        Identified = ($candidates.Count -gt 0)
+        Account    = $account
     }
 }
 
@@ -647,15 +729,10 @@ function Connect-PimGraphTenant {
         $existing = Get-PimGraphContext
         if (Test-PimGraphContext -Context $existing -TenantId $TenantId -GraphEnvironment $graphEnvironment -RequiredScopes $FallbackScopes) {
             # The account is checked separately because establishing it may need a
-            # Graph call, which Test-PimGraphContext deliberately cannot make. That
-            # call is only worth making when there is an account to check against.
-            $accountMatches = $true
-            if (-not [string]::IsNullOrWhiteSpace($ExpectedAccount)) {
-                $existingAccount = Resolve-PimContextAccount -Context $existing -GraphBaseUri $CloudConfiguration.GraphBaseUri
-                $accountMatches = Test-PimAccountMatch -Expected $ExpectedAccount -Actual $existingAccount
-            }
+            # Graph call, which Test-PimGraphContext deliberately cannot make.
+            $identity = Test-PimGraphIdentity -Context $existing -ExpectedAccount $ExpectedAccount -GraphBaseUri $CloudConfiguration.GraphBaseUri
 
-            if ($accountMatches) {
+            if ($identity.Matched) {
                 $grantedScopes = @(Get-PimPropertyValue -InputObject $existing -Name 'Scopes')
                 Write-PimLog -Operation 'Connect-Graph' -TenantId $TenantId -Status 'Reused' -Message 'Reusing the existing Microsoft Graph context.'
                 return (New-PimGraphConnectionResult -Success $true -TenantId $TenantId -Context $existing -Scopes $grantedScopes -Message 'Reused the existing Microsoft Graph session.')
@@ -720,14 +797,22 @@ function Connect-PimGraphTenant {
             # Signing in again is not proof of who we signed in as. The broker can
             # satisfy the request from a cached account without prompting, so the
             # identity has to be confirmed after connecting, not just before.
-            if (-not [string]::IsNullOrWhiteSpace($ExpectedAccount)) {
-                $actualAccount = Resolve-PimContextAccount -Context $context -GraphBaseUri $CloudConfiguration.GraphBaseUri
-                if (-not (Test-PimAccountMatch -Expected $ExpectedAccount -Actual $actualAccount)) {
-                    $reported = $actualAccount
-                    if ([string]::IsNullOrWhiteSpace($reported)) { $reported = 'an account that could not be identified' }
-                    throw ("Microsoft Graph signed in as $reported but Azure is signed in as $ExpectedAccount. " +
-                           'Sign out of the other account, or start the tool again and choose the matching account.')
-                }
+            $identity = Test-PimGraphIdentity -Context $context -ExpectedAccount $ExpectedAccount -GraphBaseUri $CloudConfiguration.GraphBaseUri
+
+            if (-not $identity.Identified) {
+                throw ('Microsoft Graph connected but would not say which account the session belongs to. ' +
+                       'Sign in again, and if this persists check that the tenant allows guests to read their own profile.')
+            }
+
+            $accountWarning = ''
+            if (-not $identity.Matched) {
+                # Not treated as a failure. A guest UPN is minted from the invited
+                # address, so in any organisation whose UPN differs from its primary
+                # mail address the two names differ for one legitimate person, and
+                # refusing here would block the cross-tenant case the tool exists for.
+                $accountWarning = "Microsoft Graph signed in as $($identity.Account) but Azure is signed in as $ExpectedAccount. " +
+                                  'If those are not the same person, close the tool and sign in again before activating anything.'
+                Write-PimLog -Level Warning -Operation 'Connect-Graph' -TenantId $TenantId -Status 'AccountMismatch' -Message $accountWarning
             }
 
             $grantedScopes = @(Get-PimPropertyValue -InputObject $context -Name 'Scopes')
@@ -735,6 +820,7 @@ function Connect-PimGraphTenant {
             if ($attempt.IsFallback) {
                 $message = 'Connected with reduced permissions. Group display names may show as IDs.'
             }
+            if ($accountWarning) { $message = "$message $accountWarning" }
 
             Write-PimLog -Operation 'Connect-Graph' -TenantId $TenantId -Status 'Succeeded' -Message $message
             return (New-PimGraphConnectionResult -Success $true -TenantId $TenantId -Context $context -Scopes $grantedScopes -Message $message)
@@ -1089,7 +1175,15 @@ function Get-PimGraphCollection {
 function Get-CurrentGraphUser {
     <#
     .SYNOPSIS
-        Returns the signed-in user's object ID, UPN, and display name in the current tenant.
+        Returns the signed-in user's object ID, UPN, display name, and mail addresses
+        in the current tenant.
+
+    .DESCRIPTION
+        The mail addresses matter because a B2B guest's UPN is minted from the
+        address the invitation was sent to, not from their home UPN. Where an
+        organisation's UPN differs from its primary SMTP address, the UPN is the
+        only value Azure reports and the mail is the only value Graph reports, so
+        both are needed to recognise one person across the two.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -1098,7 +1192,7 @@ function Get-CurrentGraphUser {
         [string] $GraphBaseUri
     )
 
-    $uri = "$(Format-PimBaseUri -Uri $GraphBaseUri)/v1.0/me?`$select=id,userPrincipalName,displayName"
+    $uri = "$(Format-PimBaseUri -Uri $GraphBaseUri)/v1.0/me?`$select=id,userPrincipalName,displayName,mail,otherMails"
     $response = Invoke-PimGraphRequest -Uri $uri -Method GET
 
     $id = Get-PimPropertyValue -InputObject $response -Name 'id'
@@ -1106,10 +1200,16 @@ function Get-CurrentGraphUser {
         throw 'Microsoft Graph did not return an object ID for the signed-in user.'
     }
 
+    $otherMails = @(Get-PimPropertyValue -InputObject $response -Name 'otherMails') |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        ForEach-Object { [string]$_ }
+
     [pscustomobject]@{
         Id                = [string]$id
         UserPrincipalName = [string](Get-PimPropertyValue -InputObject $response -Name 'userPrincipalName')
         DisplayName       = [string](Get-PimPropertyValue -InputObject $response -Name 'displayName')
+        Mail              = [string](Get-PimPropertyValue -InputObject $response -Name 'mail')
+        OtherMails        = [string[]]$otherMails
     }
 }
 
@@ -1561,6 +1661,7 @@ Export-ModuleMember -Function @(
     'Get-PimGraphAuthenticationVersion'
     'Test-PimGraphContext'
     'Resolve-PimContextAccount'
+    'Test-PimGraphIdentity'
     'Test-PimConnectSupportsLoginHint'
     'Connect-PimGraphTenant'
     'Compare-PimScopeSet'

@@ -337,11 +337,24 @@ Describe 'Test-PimGraphContext' {
 Describe 'Resolve-PimContextAccount' {
     AfterEach { Clear-PimCommandOverride }
 
-    It 'uses the account the context already reports' {
-        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p) throw 'Graph should not be called.' }
+    It 'gathers every name Graph knows the session by' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            @{
+                id                = '22222222-2222-2222-2222-222222222222'
+                userPrincipalName = 'ada.lovelace_contoso.com#EXT#@fabrikam.onmicrosoft.com'
+                displayName       = 'Ada'
+                mail              = 'ada.lovelace@contoso.com'
+                otherMails        = @('e123456@corp.contoso.com')
+            }
+        }
         $context = [pscustomobject]@{ Account = 'ada@contoso.com' }
-        Resolve-PimContextAccount -Context $context -GraphBaseUri 'https://graph.microsoft.com' |
-            Should -Be 'ada@contoso.com'
+
+        $names = @(Resolve-PimContextAccount -Context $context -GraphBaseUri 'https://graph.microsoft.com')
+
+        $names | Should -Contain 'ada@contoso.com'
+        $names | Should -Contain 'ada.lovelace_contoso.com#EXT#@fabrikam.onmicrosoft.com'
+        $names | Should -Contain 'ada.lovelace@contoso.com'
+        $names | Should -Contain 'e123456@corp.contoso.com'
     }
 
     It 'asks Graph who it is when the context has no account' {
@@ -350,18 +363,84 @@ Describe 'Resolve-PimContextAccount' {
             @{ id = '22222222-2222-2222-2222-222222222222'; userPrincipalName = 'ada_contoso.com#EXT#@fabrikam.onmicrosoft.com'; displayName = 'Ada' }
         }
         $context = [pscustomobject]@{ Account = '' }
-        Resolve-PimContextAccount -Context $context -GraphBaseUri 'https://graph.microsoft.com' |
-            Should -Be 'ada_contoso.com#EXT#@fabrikam.onmicrosoft.com'
+
+        @(Resolve-PimContextAccount -Context $context -GraphBaseUri 'https://graph.microsoft.com') |
+            Should -Contain 'ada_contoso.com#EXT#@fabrikam.onmicrosoft.com'
     }
 
-    It 'returns nothing when the principal cannot be established' {
+    It 'keeps the context account when the directory read is denied' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p) throw 'Forbidden' }
+        $context = [pscustomobject]@{ Account = 'ada@contoso.com' }
+
+        @(Resolve-PimContextAccount -Context $context -GraphBaseUri 'https://graph.microsoft.com') |
+            Should -Be @('ada@contoso.com')
+    }
+
+    It 'returns nothing when the principal cannot be established at all' {
         Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p) throw 'Forbidden' }
         $context = [pscustomobject]@{ Account = '' }
-        Resolve-PimContextAccount -Context $context -GraphBaseUri 'https://graph.microsoft.com' | Should -Be ''
+
+        @(Resolve-PimContextAccount -Context $context -GraphBaseUri 'https://graph.microsoft.com').Count | Should -Be 0
     }
 
-    It 'returns nothing for a null context' {
-        Resolve-PimContextAccount -Context $null -GraphBaseUri 'https://graph.microsoft.com' | Should -Be ''
+    It 'returns nothing for a null context when Graph is unreachable' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p) throw 'Forbidden' }
+        @(Resolve-PimContextAccount -Context $null -GraphBaseUri 'https://graph.microsoft.com').Count | Should -Be 0
+    }
+}
+
+Describe 'Test-PimGraphIdentity' {
+    AfterEach { Clear-PimCommandOverride }
+
+    It 'does not call Graph when the context account already matches' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p) throw 'Graph should not be called.' }
+        $context = [pscustomobject]@{ Account = 'ada_contoso.com#EXT#@fabrikam.onmicrosoft.com' }
+
+        $identity = Test-PimGraphIdentity -Context $context -ExpectedAccount 'ada@contoso.com' -GraphBaseUri 'https://graph.microsoft.com'
+
+        $identity.Matched    | Should -BeTrue
+        $identity.Identified | Should -BeTrue
+    }
+
+    It 'does not call Graph when no account is expected' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p) throw 'Graph should not be called.' }
+        $context = [pscustomobject]@{ Account = '' }
+
+        (Test-PimGraphIdentity -Context $context -ExpectedAccount '' -GraphBaseUri 'https://graph.microsoft.com').Matched |
+            Should -BeTrue
+    }
+
+    It 'widens the search only when the context account does not match' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            @{ id = '2'; userPrincipalName = 'ada.lovelace_contoso.com#EXT#@fabrikam.onmicrosoft.com'; mail = 'ada.lovelace@contoso.com'; otherMails = @('e123456@corp.contoso.com') }
+        }
+        $context = [pscustomobject]@{ Account = 'ada.lovelace_contoso.com#EXT#@fabrikam.onmicrosoft.com' }
+
+        (Test-PimGraphIdentity -Context $context -ExpectedAccount 'e123456@corp.contoso.com' -GraphBaseUri 'https://graph.microsoft.com').Matched |
+            Should -BeTrue
+    }
+
+    It 'reports an unidentified session rather than a mismatched one' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p) throw 'Forbidden' }
+        $context = [pscustomobject]@{ Account = '' }
+
+        $identity = Test-PimGraphIdentity -Context $context -ExpectedAccount 'ada@contoso.com' -GraphBaseUri 'https://graph.microsoft.com'
+
+        $identity.Identified | Should -BeFalse
+        $identity.Matched    | Should -BeFalse
+    }
+
+    It 'reports a genuine mismatch with the name to show the user' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            @{ id = '2'; userPrincipalName = 'mallory@contoso.com' }
+        }
+        $context = [pscustomobject]@{ Account = 'mallory@contoso.com' }
+
+        $identity = Test-PimGraphIdentity -Context $context -ExpectedAccount 'ada@contoso.com' -GraphBaseUri 'https://graph.microsoft.com'
+
+        $identity.Matched    | Should -BeFalse
+        $identity.Identified | Should -BeTrue
+        $identity.Account    | Should -Be 'mallory@contoso.com'
     }
 }
 
@@ -381,20 +460,48 @@ Describe 'Connect-PimGraphTenant' {
         $result.Detail  | Should -Match '2\.25\.0'
     }
 
-    It 'refuses the session when the broker signs in as somebody else' {
-        # Connecting again is not proof of who we connected as: the broker can
-        # satisfy the request from a cached account without ever prompting.
+    It 'warns but does not lock out when the names cannot be reconciled' {
+        # A guest UPN is minted from the invited address, so an organisation whose
+        # UPN differs from its primary mail produces two legitimate spellings.
+        # Refusing here would block the cross-tenant case the tool exists for.
         Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) }
         Set-PimCommandOverride -Name 'Get-MgContext' -Handler { param($p)
             [pscustomobject]@{ TenantId = '11111111-1111-1111-1111-111111111111'; Environment = 'Global'; Account = 'mallory@contoso.com'; Scopes = (Get-PimMinimumGraphScope) }
+        }
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            @{ id = '22222222-2222-2222-2222-222222222222'; userPrincipalName = 'mallory@contoso.com'; displayName = 'M' }
         }
 
         $result = Connect-PimGraphTenant -TenantId $script:TenantId -CloudConfiguration $script:CommercialCloud `
             -Force -ExpectedAccount 'ada@contoso.com'
 
-        $result.Success | Should -BeFalse
-        $result.Detail  | Should -Match 'mallory@contoso.com'
-        $result.Detail  | Should -Match 'ada@contoso.com'
+        $result.Success | Should -BeTrue
+        $result.Message | Should -Match 'mallory@contoso.com'
+        $result.Message | Should -Match 'ada@contoso.com'
+        $result.Message | Should -Match 'not the same person'
+    }
+
+    It 'reconciles an invited mail address against a different Azure UPN' {
+        # Azure reports the UPN; the guest UPN folds to the invited mail address.
+        Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) }
+        Set-PimCommandOverride -Name 'Get-MgContext' -Handler { param($p)
+            [pscustomobject]@{ TenantId = '11111111-1111-1111-1111-111111111111'; Environment = 'Global'; Account = 'ada.lovelace_contoso.com#EXT#@fabrikam.onmicrosoft.com'; Scopes = (Get-PimMinimumGraphScope) }
+        }
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            @{
+                id                = '22222222-2222-2222-2222-222222222222'
+                userPrincipalName = 'ada.lovelace_contoso.com#EXT#@fabrikam.onmicrosoft.com'
+                displayName       = 'Ada Lovelace'
+                mail              = 'ada.lovelace@contoso.com'
+                otherMails        = @('e123456@corp.contoso.com')
+            }
+        }
+
+        $result = Connect-PimGraphTenant -TenantId $script:TenantId -CloudConfiguration $script:CommercialCloud `
+            -Force -ExpectedAccount 'e123456@corp.contoso.com'
+
+        $result.Success | Should -BeTrue
+        $result.Message | Should -Not -Match 'not the same person'
     }
 
     It 'accepts the session when the broker signs in as the guest form of the same person' {
@@ -409,7 +516,7 @@ Describe 'Connect-PimGraphTenant' {
         $result.Success | Should -BeTrue
     }
 
-    It 'refuses a token-based session whose principal cannot be established' {
+    It 'refuses a session that will not say who it belongs to' {
         # Account is blank and /me fails, so there is no evidence of who this is.
         Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) }
         Set-PimCommandOverride -Name 'Get-MgContext' -Handler { param($p)
@@ -421,7 +528,7 @@ Describe 'Connect-PimGraphTenant' {
             -Force -ExpectedAccount 'ada@contoso.com'
 
         $result.Success | Should -BeFalse
-        $result.Detail  | Should -Match 'could not be identified'
+        $result.Detail  | Should -Match 'which account the session belongs to'
     }
 
     It 'accepts a token-based session once Graph confirms the principal' {

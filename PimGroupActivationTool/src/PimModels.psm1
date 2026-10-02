@@ -1174,13 +1174,20 @@ function Test-PimJustification {
 function ConvertTo-PimHomeAccountName {
     <#
     .SYNOPSIS
-        Reduces a B2B guest user principal name to the home account it was minted from.
+        Reduces a B2B guest user principal name to the address it was minted from.
 
     .DESCRIPTION
         When a user is invited into another tenant, Entra stores them under a
-        deterministic external UPN: ada@contoso.com becomes
-        ada_contoso.com#EXT#@fabrikam.onmicrosoft.com. Folding that back to the
-        home form lets one account be compared across tenants.
+        deterministic external UPN built from the address the invitation was sent
+        to: an invitation to ada@contoso.com becomes
+        ada_contoso.com#EXT#@fabrikam.onmicrosoft.com. Folding that back lets one
+        account be recognised across tenants.
+
+        Note that the recovered value is the *invited address*, which is not
+        always the user's Azure UPN - organisations where the UPN differs from the
+        primary SMTP address will produce two legitimately different strings. That
+        is why callers compare against a set of candidate names rather than
+        treating this one value as definitive.
 
         Anything that is not in the external form is returned unchanged, so a
         plain UPN is its own home name.
@@ -1200,9 +1207,9 @@ function ConvertTo-PimHomeAccountName {
     $marker = $value.IndexOf('#EXT#', [System.StringComparison]::OrdinalIgnoreCase)
     if ($marker -lt 0) { return $value }
 
-    # Everything before the marker is the mangled home UPN, whose final
-    # underscore stands in for the '@'. Domains cannot contain '_', so the last
-    # underscore is unambiguous even when the local part has its own.
+    # Everything before the marker is the invited address, whose final underscore
+    # stands in for the '@'. Domains cannot contain '_', so the last underscore is
+    # unambiguous even when the local part has its own.
     $mangled = $value.Substring(0, $marker)
     $split = $mangled.LastIndexOf('_')
     if ($split -le 0 -or $split -eq ($mangled.Length - 1)) { return $value }
@@ -1213,21 +1220,26 @@ function ConvertTo-PimHomeAccountName {
 function Test-PimAccountMatch {
     <#
     .SYNOPSIS
-        Returns $true when two account names identify the same person.
+        Returns $true when any of the candidate account names identifies the
+        expected person.
 
     .DESCRIPTION
         The tool compares the account it signed in to Azure with against the
         account on a Microsoft Graph context. In a tenant the user is a guest of,
         those two strings are legitimately different spellings of one identity:
-        Azure reports the home UPN and Graph reports the B2B external UPN. A
-        literal comparison would reject the valid sessions this tool exists to
-        create, so both sides are folded to their home form first.
+        Azure reports the UPN while Graph reports a B2B external UPN minted from
+        the invited address. A literal comparison would reject the valid sessions
+        this tool exists to create, so both sides are folded first.
+
+        Several candidates are accepted because no single Graph property is
+        guaranteed to spell the account the way Azure does. Where an organisation's
+        UPN differs from its primary SMTP address, the folded guest UPN yields the
+        mail address and only the mail properties can bridge the two.
 
         When no account is expected there is nothing to enforce and everything
-        matches. When an account *is* expected, an unknown actual account is a
-        failure rather than a pass: a Graph context carries no account when it was
-        built from a caller-supplied token, and that context may belong to anyone.
-        Callers that can resolve the real principal should do so and pass it here.
+        matches. When an account *is* expected, an empty candidate set is a failure
+        rather than a pass: a Graph context carries no account when it was built
+        from a caller-supplied token, and that context may belong to anyone.
     #>
     [CmdletBinding()]
     [OutputType([bool])]
@@ -1239,17 +1251,25 @@ function Test-PimAccountMatch {
 
         [Parameter()]
         [AllowNull()]
-        [AllowEmptyString()]
-        [string] $Actual
+        [AllowEmptyCollection()]
+        [string[]] $Actual
     )
 
     if ([string]::IsNullOrWhiteSpace($Expected)) { return $true }
-    if ([string]::IsNullOrWhiteSpace($Actual))   { return $false }
+    if ($null -eq $Actual) { return $false }
 
-    $left  = ConvertTo-PimHomeAccountName -Account $Expected
-    $right = ConvertTo-PimHomeAccountName -Account $Actual
+    $left = ConvertTo-PimHomeAccountName -Account $Expected
 
-    return [string]::Equals($left, $right, [System.StringComparison]::OrdinalIgnoreCase)
+    foreach ($candidate in $Actual) {
+        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+
+        $right = ConvertTo-PimHomeAccountName -Account $candidate
+        if ([string]::Equals($left, $right, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+
+    return $false
 }
 
 function Get-PimSubmissionReadiness {
