@@ -295,6 +295,10 @@ if ($isGui) {
 # Headless helpers
 # ---------------------------------------------------------------------------
 
+# Captured from the Azure sign-in so a stale Graph context belonging to a
+# different user is never reused.
+$script:PimSignedInAccount = $null
+
 function Connect-PimHeadlessTenant {
     [CmdletBinding()]
     param(
@@ -302,7 +306,7 @@ function Connect-PimHeadlessTenant {
         [string] $Tenant
     )
 
-    $connection = Connect-PimGraphTenant -TenantId $Tenant -CloudConfiguration $cloudConfiguration -UseDeviceAuthentication:$UseDeviceAuthentication
+    $connection = Connect-PimGraphTenant -TenantId $Tenant -CloudConfiguration $cloudConfiguration -UseDeviceAuthentication:$UseDeviceAuthentication -ExpectedAccount $script:PimSignedInAccount
     if (-not $connection.Success) {
         throw $connection.Message
     }
@@ -319,6 +323,7 @@ function Get-PimHeadlessTenantList {
     param()
 
     $signIn = Connect-PimAzureAccount -CloudConfiguration $cloudConfiguration -UseDeviceAuthentication:$UseDeviceAuthentication
+    $script:PimSignedInAccount = $signIn.Account
     Write-Host "Signed in as $($signIn.Account) ($($cloudConfiguration.DisplayName))." -ForegroundColor Green
 
     $tenants = Get-PimAuthorizedTenant -CloudConfiguration $cloudConfiguration
@@ -411,7 +416,8 @@ if ($Activate) {
     Assert-PimGuid -Value $tenant -ParameterName 'TenantId'
     foreach ($id in $GroupId) { Assert-PimGuid -Value $id -ParameterName 'GroupId' }
 
-    $null = Connect-PimAzureAccount -CloudConfiguration $cloudConfiguration -UseDeviceAuthentication:$UseDeviceAuthentication
+    $signIn = Connect-PimAzureAccount -CloudConfiguration $cloudConfiguration -UseDeviceAuthentication:$UseDeviceAuthentication
+    $script:PimSignedInAccount = $signIn.Account
     $null = Connect-PimHeadlessTenant -Tenant $tenant
     $me = Get-CurrentGraphUser -GraphBaseUri $cloudConfiguration.GraphBaseUri
     Write-Host "Activating as $($me.UserPrincipalName) in tenant $tenant." -ForegroundColor Cyan

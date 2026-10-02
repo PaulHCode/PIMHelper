@@ -235,7 +235,8 @@ $script:LoadGroupsWorker = {
         [object]    $CloudConfiguration,
         [object[]]  $Tenants,
         [bool]      $UseDeviceCode,
-        [hashtable] $Shared
+        [hashtable] $Shared,
+        [string]    $ExpectedAccount
     )
 
     Set-StrictMode -Version Latest
@@ -268,7 +269,7 @@ $script:LoadGroupsWorker = {
         $Shared.Status = "Connecting to $($tenant.TenantDisplayName) ($index of $($Tenants.Count))..."
         Write-Information "Connecting to $($tenant.TenantDisplayName) [$($tenant.TenantId)]..."
 
-        $connection = Connect-PimGraphTenant -TenantId $tenant.TenantId -CloudConfiguration $CloudConfiguration -UseDeviceAuthentication:([bool]$UseDeviceCode)
+        $connection = Connect-PimGraphTenant -TenantId $tenant.TenantId -CloudConfiguration $CloudConfiguration -UseDeviceAuthentication:([bool]$UseDeviceCode) -ExpectedAccount $ExpectedAccount
 
         if (-not $connection.Success) {
             Write-Warning "$($tenant.TenantDisplayName): $($connection.Message)"
@@ -348,7 +349,8 @@ $script:SubmitWorker = {
         [string]    $TicketNumber,
         [string]    $TicketSystem,
         [bool]      $UseDeviceCode,
-        [hashtable] $Shared
+        [hashtable] $Shared,
+        [string]    $ExpectedAccount
     )
 
     Set-StrictMode -Version Latest
@@ -379,7 +381,7 @@ $script:SubmitWorker = {
         $Shared.Status = "Connecting to $tenantName..."
         Write-Information "Connecting to $tenantName [$tenantId]..."
 
-        $connection = Connect-PimGraphTenant -TenantId $tenantId -CloudConfiguration $CloudConfiguration -UseDeviceAuthentication:([bool]$UseDeviceCode)
+        $connection = Connect-PimGraphTenant -TenantId $tenantId -CloudConfiguration $CloudConfiguration -UseDeviceAuthentication:([bool]$UseDeviceCode) -ExpectedAccount $ExpectedAccount
 
         if (-not $connection.Success) {
             Write-Warning "$tenantName`: $($connection.Message)"
@@ -1313,6 +1315,7 @@ function Show-PimMainForm {
             CloudConfiguration = $ui.Cloud
             Tenants            = $selectedTenants
             UseDeviceCode      = [bool]$checkDeviceCode.Checked
+            ExpectedAccount    = [string]$ui.Account
         } 'LoadingGroups'
     })
 
@@ -1347,6 +1350,7 @@ function Show-PimMainForm {
             TicketNumber       = $textTicketNumber.Text
             TicketSystem       = $textTicketSystem.Text
             UseDeviceCode      = [bool]$checkDeviceCode.Checked
+            ExpectedAccount    = [string]$ui.Account
         } 'Submitting'
     })
 

@@ -288,6 +288,7 @@ Describe 'Test-PimGraphContext' {
         $script:GoodContext = [pscustomobject]@{
             TenantId    = '11111111-1111-1111-1111-111111111111'
             Environment = 'Global'
+            Account     = 'ada@contoso.com'
             Scopes      = @('PrivilegedEligibilitySchedule.Read.AzureADGroup', 'PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup', 'User.Read')
         }
     }
@@ -315,6 +316,20 @@ Describe 'Test-PimGraphContext' {
     It 'matches the tenant ID case-insensitively' {
         $context = [pscustomobject]@{ TenantId = 'AAAAAAAA-1111-1111-1111-111111111111'; Environment = 'Global'; Scopes = @() }
         Test-PimGraphContext -Context $context -TenantId 'aaaaaaaa-1111-1111-1111-111111111111' -GraphEnvironment 'global' | Should -BeTrue
+    }
+
+    It 'rejects a context belonging to a different signed-in account' {
+        Test-PimGraphContext -Context $script:GoodContext -TenantId $script:TenantId -GraphEnvironment 'Global' -ExpectedAccount 'bob@contoso.com' | Should -BeFalse
+    }
+
+    It 'accepts a context whose account matches, ignoring case' {
+        Test-PimGraphContext -Context $script:GoodContext -TenantId $script:TenantId -GraphEnvironment 'Global' -ExpectedAccount 'ADA@contoso.com' | Should -BeTrue
+    }
+
+    It 'ignores the account check when no account is expected' {
+        foreach ($expected in @($null, '', '   ')) {
+            Test-PimGraphContext -Context $script:GoodContext -TenantId $script:TenantId -GraphEnvironment 'Global' -ExpectedAccount $expected | Should -BeTrue
+        }
     }
 }
 

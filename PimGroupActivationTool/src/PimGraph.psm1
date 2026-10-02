@@ -452,7 +452,7 @@ function Test-PimGraphContext {
     <#
     .SYNOPSIS
         Returns $true when the current Graph context targets the expected tenant,
-        environment, and scopes.
+        environment, account, and scopes.
     #>
     [CmdletBinding()]
     [OutputType([bool])]
@@ -469,7 +469,11 @@ function Test-PimGraphContext {
 
         [Parameter()]
         [AllowNull()]
-        [string[]] $RequiredScopes
+        [string[]] $RequiredScopes,
+
+        [Parameter()]
+        [AllowNull()]
+        [string] $ExpectedAccount
     )
 
     if ($null -eq $Context) { return $false }
@@ -482,6 +486,15 @@ function Test-PimGraphContext {
     $contextEnvironment = Get-PimPropertyValue -InputObject $Context -Name 'Environment'
     if (-not [string]::Equals([string]$contextEnvironment, $GraphEnvironment, [System.StringComparison]::OrdinalIgnoreCase)) {
         return $false
+    }
+
+    # A stale context can belong to a different signed-in user after an account
+    # switch, which would silently enumerate somebody else's eligible groups.
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedAccount)) {
+        $contextAccount = Get-PimPropertyValue -InputObject $Context -Name 'Account'
+        if (-not [string]::Equals([string]$contextAccount, $ExpectedAccount, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $false
+        }
     }
 
     if ($RequiredScopes) {
@@ -531,7 +544,11 @@ function Connect-PimGraphTenant {
         [switch] $Force,
 
         [Parameter()]
-        [switch] $UseDeviceAuthentication
+        [switch] $UseDeviceAuthentication,
+
+        [Parameter()]
+        [AllowNull()]
+        [string] $ExpectedAccount
     )
 
     if (-not $Scopes)         { $Scopes = $script:DefaultGraphScopes }
@@ -541,7 +558,7 @@ function Connect-PimGraphTenant {
 
     if (-not $Force) {
         $existing = Get-PimGraphContext
-        if (Test-PimGraphContext -Context $existing -TenantId $TenantId -GraphEnvironment $graphEnvironment -RequiredScopes $FallbackScopes) {
+        if (Test-PimGraphContext -Context $existing -TenantId $TenantId -GraphEnvironment $graphEnvironment -RequiredScopes $FallbackScopes -ExpectedAccount $ExpectedAccount) {
             $grantedScopes = @(Get-PimPropertyValue -InputObject $existing -Name 'Scopes')
             Write-PimLog -Operation 'Connect-Graph' -TenantId $TenantId -Status 'Reused' -Message 'Reusing the existing Microsoft Graph context.'
             return (New-PimGraphConnectionResult -Success $true -TenantId $TenantId -Context $existing -Scopes $grantedScopes -Message 'Reused the existing Microsoft Graph session.')
