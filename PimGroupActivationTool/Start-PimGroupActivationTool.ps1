@@ -404,7 +404,7 @@ if ($ListActive) {
         }
     }
 
-    $allActive | Select-Object TenantDisplayName, GroupId, AccessId, AssignmentType, Status, MemberType, TenantId |
+    $allActive | Select-Object TenantDisplayName, GroupDisplayName, AccessId, AssignmentType, Status, MemberType, EndDateTime, GroupId, TenantId |
         Format-Table -AutoSize | Out-Host
     $allActive
     exit 0

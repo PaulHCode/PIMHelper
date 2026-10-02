@@ -2051,6 +2051,10 @@ function Get-PimActiveGroupAssignment {
         Pass -IgnoreFailure when the caller only wants a best-effort decoration of an
         existing list. Without it, a failure is thrown so the caller can tell "nothing
         is active" apart from "the query did not run".
+
+        Group display names are resolved so the result reads as an answer rather than
+        a list of GUIDs. Pass -SkipGroupNameResolution to skip those lookups when the
+        caller already has names or only needs to match on ID.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -2069,7 +2073,10 @@ function Get-PimActiveGroupAssignment {
         [string] $TenantDisplayName,
 
         [Parameter()]
-        [switch] $IgnoreFailure
+        [switch] $IgnoreFailure,
+
+        [Parameter()]
+        [switch] $SkipGroupNameResolution
     )
 
     $baseUri = Format-PimBaseUri -Uri $GraphBaseUri
@@ -2090,17 +2097,54 @@ function Get-PimActiveGroupAssignment {
         if ($null -eq $schedule) { continue }
 
         $assignmentType = [string](Get-PimPropertyValue -InputObject $schedule -Name 'assignmentType')
+        $groupId = [string](Get-PimPropertyValue -InputObject $schedule -Name 'groupId')
+
+        # -ListActive answers "what do I have right now", and a bare GUID does not
+        # answer it. The expanded group rides along on some responses; otherwise
+        # fall back to the same cached lookup the eligible list uses.
+        $groupDisplayName = $null
+        $expandedGroup = Get-PimPropertyValue -InputObject $schedule -Name 'group'
+        if ($expandedGroup) {
+            $groupDisplayName = [string](Get-PimPropertyValue -InputObject $expandedGroup -Name 'displayName')
+        }
+
+        if ([string]::IsNullOrWhiteSpace($groupDisplayName) -and -not $SkipGroupNameResolution -and
+            -not [string]::IsNullOrWhiteSpace($groupId)) {
+            # Decoration must never cost the caller the list itself, and
+            # Resolve-PimGroup rejects an ID that is not a GUID.
+            try {
+                $groupDisplayName = (Resolve-PimGroup -GroupId $groupId -GraphBaseUri $baseUri -TenantId $TenantId).DisplayName
+            }
+            catch {
+                Write-PimLog -Level Debug -Operation 'Get-Active' -TenantId $TenantId -GroupId $groupId -Message "Could not resolve the group display name: $($_.Exception.Message)"
+            }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($groupDisplayName)) { $groupDisplayName = $groupId }
+
+        # Knowing what is active without knowing when it lapses is half an answer.
+        $endDateTime = $null
+        $scheduleInfo = Get-PimPropertyValue -InputObject $schedule -Name 'scheduleInfo'
+        if ($scheduleInfo) {
+            $expiration = Get-PimPropertyValue -InputObject $scheduleInfo -Name 'expiration'
+            if ($expiration) {
+                $endDateTime = Get-PimPropertyValue -InputObject $expiration -Name 'endDateTime'
+            }
+        }
+
         # 'activated' means it came from an eligibility; 'assigned' is a direct active assignment.
         # Tenant identity has to travel with the record: -ListActive merges every
         # tenant into one table, and a group ID alone does not say where it lives.
         $records.Add([pscustomobject]@{
             TenantId          = [string]$TenantId
             TenantDisplayName = [string]$TenantDisplayName
-            GroupId           = [string](Get-PimPropertyValue -InputObject $schedule -Name 'groupId')
+            GroupId           = $groupId
+            GroupDisplayName  = $groupDisplayName
             AccessId          = [string](Get-PimPropertyValue -InputObject $schedule -Name 'accessId')
             AssignmentType    = $assignmentType
             Status            = [string](Get-PimPropertyValue -InputObject $schedule -Name 'status')
             MemberType        = [string](Get-PimPropertyValue -InputObject $schedule -Name 'memberType')
+            EndDateTime       = $endDateTime
         })
     }
 

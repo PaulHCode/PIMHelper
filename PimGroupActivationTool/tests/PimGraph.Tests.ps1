@@ -1693,8 +1693,72 @@ Describe 'Get-PimActiveGroupAssignment' {
         $active[0].TenantDisplayName | Should -Be 'Contoso'
     }
 
-    It 'throws by default when the query is not permitted' {
-        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p) throw '{"error":{"code":"Authorization_RequestDenied"}}' }
+    It 'resolves the group display name so the list is readable' {
+        # -ListActive is documented as answering "what is already active?", and a
+        # GUID does not answer it. The eligible list resolves names; this one did
+        # not, so the one command whose whole job is to be read was unreadable.
+        $script:GroupLookups = 0
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            if ($p['Uri'] -match '/groups/') {
+                $script:GroupLookups++
+                return @{ id = $script:GroupId; displayName = 'Contoso Admins'; description = 'd' }
+            }
+            @{ value = @(@{ groupId = $script:GroupId; accessId = 'member'; assignmentType = 'activated'; status = 'Provisioned'; memberType = 'direct' }) }
+        }
+
+        $active = Get-PimActiveGroupAssignment -GraphBaseUri 'https://graph.microsoft.com' -TenantId $script:TenantId
+        $active[0].GroupDisplayName | Should -Be 'Contoso Admins'
+        $script:GroupLookups        | Should -Be 1
+    }
+
+    It 'prefers an expanded group over a second round trip' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            if ($p['Uri'] -match '/groups/') { throw 'Should not have looked the group up.' }
+            @{ value = @(@{ groupId = $script:GroupId; accessId = 'member'; assignmentType = 'activated'
+                            group = @{ displayName = 'Expanded Name' } }) }
+        }
+
+        $active = Get-PimActiveGroupAssignment -GraphBaseUri 'https://graph.microsoft.com' -TenantId $script:TenantId
+        $active[0].GroupDisplayName | Should -Be 'Expanded Name'
+    }
+
+    It 'skips the lookup when asked to' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            if ($p['Uri'] -match '/groups/') { throw 'Should not have looked the group up.' }
+            @{ value = @(@{ groupId = $script:GroupId; accessId = 'member'; assignmentType = 'activated' }) }
+        }
+
+        $active = Get-PimActiveGroupAssignment -GraphBaseUri 'https://graph.microsoft.com' `
+            -TenantId $script:TenantId -SkipGroupNameResolution
+
+        # Falls back to the ID rather than an empty column.
+        $active[0].GroupDisplayName | Should -Be $script:GroupId
+    }
+
+    It 'still returns the list when a group cannot be resolved' {
+        # Decoration must never cost the caller the data they asked for, and a
+        # malformed ID makes Resolve-PimGroup throw rather than return.
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            @{ value = @(@{ groupId = 'not-a-guid'; accessId = 'member'; assignmentType = 'activated' }) }
+        }
+
+        $active = Get-PimActiveGroupAssignment -GraphBaseUri 'https://graph.microsoft.com' -TenantId $script:TenantId
+        $active.Count               | Should -Be 1
+        $active[0].GroupDisplayName | Should -Be 'not-a-guid'
+    }
+
+    It 'reports when the access lapses' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            if ($p['Uri'] -match '/groups/') { return @{ id = $script:GroupId; displayName = 'g' } }
+            @{ value = @(@{ groupId = $script:GroupId; accessId = 'member'; assignmentType = 'activated'
+                            scheduleInfo = @{ expiration = @{ endDateTime = '2026-01-01T00:00:00Z' } } }) }
+        }
+
+        $active = Get-PimActiveGroupAssignment -GraphBaseUri 'https://graph.microsoft.com' -TenantId $script:TenantId
+        $active[0].EndDateTime | Should -Be '2026-01-01T00:00:00Z'
+    }
+
+    It 'throws by default when the query is not permitted' {        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p) throw '{"error":{"code":"Authorization_RequestDenied"}}' }
         { Get-PimActiveGroupAssignment -GraphBaseUri 'https://graph.microsoft.com' } |
             Should -Throw -ExpectedMessage '*active assignments*'
     }
