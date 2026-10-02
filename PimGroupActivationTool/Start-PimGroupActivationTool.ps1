@@ -394,8 +394,14 @@ if ($ListActive) {
     foreach ($tenant in $tenants) {
         Write-Host "Querying $($tenant.TenantDisplayName) ($($tenant.TenantId))..." -ForegroundColor Cyan
         try {
-            $null = Connect-PimHeadlessTenant -Tenant $tenant.TenantId
-            $active = Get-PimActiveGroupAssignment -GraphBaseUri $cloudConfiguration.GraphBaseUri -TenantId $tenant.TenantId -TenantDisplayName $tenant.TenantDisplayName
+            $connection = Connect-PimHeadlessTenant -Tenant $tenant.TenantId
+            # Without Group.Read.All every name lookup is a guaranteed 403, so skip
+            # them rather than spending a round trip and an audit entry per group.
+            $skipNames = ($connection.PSObject.Properties['HasGroupRead'] -and -not $connection.HasGroupRead)
+
+            $active = Get-PimActiveGroupAssignment -GraphBaseUri $cloudConfiguration.GraphBaseUri `
+                -TenantId $tenant.TenantId -TenantDisplayName $tenant.TenantDisplayName `
+                -SkipGroupNameResolution:$skipNames
             foreach ($item in $active) { $allActive.Add($item) }
             Write-Host "  $($active.Count) active assignment(s)." -ForegroundColor Green
         }

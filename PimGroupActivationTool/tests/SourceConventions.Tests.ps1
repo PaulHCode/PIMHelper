@@ -191,6 +191,51 @@ Describe 'Source conventions' {
         }
     }
 
+    It 'always tells the query whether group names are readable' {
+        # Without Group.Read.All every name lookup is a guaranteed 403. The switch
+        # exists to skip them, so a caller that ignores it spends a round trip and
+        # an audit entry per group to end up with the GUID it already had.
+        # -ListActive shipped that way.
+        $accepts = New-Object System.Collections.Generic.List[string]
+        foreach ($file in $script:SourceFiles) {
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$null)
+            foreach ($function in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+                $parameters = $function.Body.ParamBlock
+                if (-not $parameters) { continue }
+                foreach ($parameter in $parameters.Parameters) {
+                    if ($parameter.Name.VariablePath.UserPath -eq 'SkipGroupNameResolution') {
+                        $accepts.Add($function.Name)
+                        break
+                    }
+                }
+            }
+        }
+
+        $accepts.Count | Should -BeGreaterThan 0 -Because 'the switch must still exist for this rule to mean anything'
+
+        $checked = 0
+        $offenders = New-Object System.Collections.Generic.List[string]
+        foreach ($file in $script:CallSiteFiles) {
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$null)
+            foreach ($call in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)) {
+                $name = $call.GetCommandName()
+                if (-not $name -or $accepts -notcontains $name) { continue }
+
+                $checked++
+                $passes = $call.CommandElements | Where-Object {
+                    $_ -is [System.Management.Automation.Language.CommandParameterAst] -and
+                    $_.ParameterName -eq 'SkipGroupNameResolution' }
+
+                if (-not $passes) {
+                    $offenders.Add("$($file.Name):$($call.Extent.StartLineNumber) $name without -SkipGroupNameResolution")
+                }
+            }
+        }
+
+        $checked | Should -BeGreaterThan 0 -Because 'the lint must actually find calls to check'
+        $offenders -join "`n" | Should -BeNullOrEmpty -Because 'a caller that omits the switch pays for lookups it knows will fail'
+    }
+
     It 'only displays columns the producing function actually emits' {
         # A Select-Object naming a property that is never set prints a blank column
         # rather than failing, so the output silently loses a field. -ListActive
@@ -199,6 +244,8 @@ Describe 'Source conventions' {
         $producers = @{
             'allActive' = 'Get-PimActiveGroupAssignment'
             'allGroups' = 'Get-PimEligibleGroups'
+            'tenants'   = 'Get-PimAuthorizedTenant'
+            'results'   = 'Request-PimGroupActivation'
         }
 
         $emitted = @{}
@@ -234,7 +281,8 @@ Describe 'Source conventions' {
         }
 
         $entryAst = [System.Management.Automation.Language.Parser]::ParseFile($script:EntryScript.FullName, [ref]$null, [ref]$null)
-        $checked = 0
+        $checked = @{}
+        foreach ($key in $producers.Keys) { $checked[$key] = 0 }
         $offenders = New-Object System.Collections.Generic.List[string]
 
         foreach ($pipeline in $entryAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.PipelineAst] }, $true)) {
@@ -242,21 +290,34 @@ Describe 'Source conventions' {
             if ($first -isnot [System.Management.Automation.Language.CommandExpressionAst]) { continue }
             if ($first.Expression -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
 
-            $producer = $producers[$first.Expression.VariablePath.UserPath]
+            $variable = $first.Expression.VariablePath.UserPath
+            $producer = $producers[$variable]
             if (-not $producer) { continue }
 
             foreach ($element in $pipeline.PipelineElements) {
                 if ($element -isnot [System.Management.Automation.Language.CommandAst]) { continue }
-                if ($element.GetCommandName() -ne 'Select-Object') { continue }
 
-                $columns = $element.CommandElements |
-                    Where-Object { $_ -is [System.Management.Automation.Language.ArrayLiteralAst] } |
-                    ForEach-Object { $_.Elements } |
-                    Where-Object { $_ -is [System.Management.Automation.Language.StringConstantExpressionAst] } |
-                    ForEach-Object { [string]$_.Value }
+                # GetCommandName returns the literal text, so an alias has to be resolved
+                # or the lint skips the pipeline it was written to check.
+                $commandName = $element.GetCommandName()
+                if (-not $commandName) { continue }
+                if ($commandName -notmatch '^(Select-Object|select)$') { continue }
+
+                # A single column parses as a bare string rather than an array literal.
+                $columns = New-Object System.Collections.Generic.List[string]
+                foreach ($argument in ($element.CommandElements | Select-Object -Skip 1)) {
+                    if ($argument -is [System.Management.Automation.Language.ArrayLiteralAst]) {
+                        foreach ($item in $argument.Elements) {
+                            if ($item -is [System.Management.Automation.Language.StringConstantExpressionAst]) { $columns.Add([string]$item.Value) }
+                        }
+                    }
+                    elseif ($argument -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+                        $columns.Add([string]$argument.Value)
+                    }
+                }
 
                 foreach ($column in $columns) {
-                    $checked++
+                    $checked[$variable]++
                     if ($emitted[$producer] -notcontains $column) {
                         $offenders.Add("$($script:EntryScript.Name):$($element.Extent.StartLineNumber) $producer never emits '$column'")
                     }
@@ -264,8 +325,10 @@ Describe 'Source conventions' {
             }
         }
 
-        # Without this the lint quietly becomes a no-op the moment a variable is renamed.
-        $checked | Should -BeGreaterThan 0 -Because 'the lint must actually find columns to check'
+        # A single total would stay green while one producer silently lost all its
+        # coverage, so every mapped producer has to account for itself.
+        $uncovered = @($producers.Keys | Where-Object { $checked[$_] -eq 0 } | Sort-Object)
+        $uncovered -join ', ' | Should -BeNullOrEmpty -Because 'a producer with no columns checked means the lint stopped watching it'
         $offenders -join "`n" | Should -BeNullOrEmpty -Because 'a column with no matching property prints blank instead of failing'
     }
 
