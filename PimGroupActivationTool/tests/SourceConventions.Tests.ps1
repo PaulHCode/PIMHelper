@@ -97,6 +97,84 @@ Describe 'Source conventions' {
         }
     }
 
+    It 'keeps the worker test stubs in step with the real functions' {
+        # The worker tests replace real functions with hand-written stubs. A stub that
+        # still declares a parameter the real function has dropped lets those tests go
+        # on passing against a contract that no longer exists, which is exactly how a
+        # removed switch survived in the workers once already.
+        $real = @{}
+        foreach ($file in $script:SourceFiles) {
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$null)
+            foreach ($function in $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+                $parameters = $null
+                if ($function.Parameters) {
+                    $parameters = $function.Parameters
+                }
+                elseif ($function.Body.ParamBlock) {
+                    $parameters = $function.Body.ParamBlock.Parameters
+                }
+
+                $real[$function.Name] = @($parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+            }
+        }
+
+        $real.Count | Should -BeGreaterThan 0
+
+        $stubFile = Join-Path -Path $PSScriptRoot -ChildPath 'PimUiWorkers.Tests.ps1'
+        $stubAst = [System.Management.Automation.Language.Parser]::ParseFile($stubFile, [ref]$null, [ref]$null)
+
+        # The stubs live inside here-strings that get written out as a module, so they
+        # are text to the outer parser. Parse each of those strings in turn.
+        $stubFunctions = New-Object System.Collections.Generic.List[object]
+        $literals = $stubAst.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.StringConstantExpressionAst] -or
+                $node -is [System.Management.Automation.Language.ExpandableStringExpressionAst]
+            }, $true)
+
+        foreach ($literal in $literals) {
+            if ($literal.Value -notmatch '(?m)^\s*function\s') {
+                continue
+            }
+
+            $inner = [System.Management.Automation.Language.Parser]::ParseInput($literal.Value, [ref]$null, [ref]$null)
+            foreach ($function in $inner.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+                $stubFunctions.Add([pscustomobject]@{
+                        Name       = $function.Name
+                        Line       = $literal.Extent.StartLineNumber + $function.Extent.StartLineNumber
+                        Definition = $function
+                    })
+            }
+        }
+
+        $checked = 0
+        $offenders = New-Object System.Collections.Generic.List[string]
+        foreach ($stub in $stubFunctions) {
+            if (-not $real.ContainsKey($stub.Name)) {
+                continue
+            }
+
+            $checked++
+            $parameters = $null
+            if ($stub.Definition.Parameters) {
+                $parameters = $stub.Definition.Parameters
+            }
+            elseif ($stub.Definition.Body.ParamBlock) {
+                $parameters = $stub.Definition.Body.ParamBlock.Parameters
+            }
+
+            foreach ($parameter in $parameters) {
+                $name = $parameter.Name.VariablePath.UserPath
+                if ($real[$stub.Name] -notcontains $name) {
+                    $offenders.Add("$($stub.Name) near line $($stub.Line): -$name no longer exists on the real function")
+                }
+            }
+        }
+
+        $checked | Should -BeGreaterThan 0 -Because 'the stubs must still shadow real functions for this check to mean anything'
+        $offenders -join "`n" | Should -BeNullOrEmpty
+    }
+
     It 'exports only functions that exist' {
         foreach ($file in $script:SourceFiles) {
             $content = Get-Content -LiteralPath $file.FullName -Raw
