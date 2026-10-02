@@ -445,9 +445,41 @@ Describe 'Test-PimGraphIdentity' {
 }
 
 Describe 'Connect-PimGraphTenant' {
-    It 'reports an actionable error when Connect-MgGraph leaves no context' {
+    It 'falls back to a device code when the broker will not show a prompt' {
         # Observed live: the WAM broker can fail to prompt and Connect-MgGraph
-        # returns without raising anything, leaving Get-MgContext null.
+        # returns without raising anything, leaving Get-MgContext null. A device
+        # code needs no window, so retrying with one gets the user signed in
+        # instead of making them discover the workaround and start over.
+        $script:ConnectCalls = @()
+        Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) $script:ConnectCalls += , $p }
+        Set-PimCommandOverride -Name 'Get-MgContext' -Handler { param($p)
+            if ($script:ConnectCalls.Count -lt 2) { return $null }
+            [pscustomobject]@{ TenantId = '11111111-1111-1111-1111-111111111111'; Environment = 'Global'; Account = 'ada@contoso.com'; Scopes = (Get-PimMinimumGraphScope) }
+        }
+
+        $result = Connect-PimGraphTenant -TenantId $script:TenantId -CloudConfiguration $script:CommercialCloud -Force
+
+        $result.Success | Should -BeTrue
+        $script:ConnectCalls.Count | Should -Be 2
+        $script:ConnectCalls[0].ContainsKey('UseDeviceCode') | Should -BeFalse -Because 'the broker is tried first'
+        $script:ConnectCalls[1]['UseDeviceCode'] | Should -BeTrue
+    }
+
+    It 'goes straight to a device code when one was asked for' {
+        $script:ConnectCalls = @()
+        Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) $script:ConnectCalls += , $p }
+        Set-PimCommandOverride -Name 'Get-MgContext' -Handler { param($p)
+            [pscustomobject]@{ TenantId = '11111111-1111-1111-1111-111111111111'; Environment = 'Global'; Account = 'ada@contoso.com'; Scopes = (Get-PimMinimumGraphScope) }
+        }
+
+        $null = Connect-PimGraphTenant -TenantId $script:TenantId -CloudConfiguration $script:CommercialCloud `
+            -Force -UseDeviceAuthentication
+
+        $script:ConnectCalls.Count | Should -Be 1 -Because 'the broker is known to be unusable'
+        $script:ConnectCalls[0]['UseDeviceCode'] | Should -BeTrue
+    }
+
+    It 'reports an actionable error when even a device code leaves no context' {
         Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) }
         Set-PimCommandOverride -Name 'Get-MgContext' -Handler { param($p) $null }
         Set-PimCommandOverride -Name 'Get-Module' -Handler { param($p) [pscustomobject]@{ Version = [version]'2.25.0' } }
@@ -455,7 +487,6 @@ Describe 'Connect-PimGraphTenant' {
         $result = Connect-PimGraphTenant -TenantId $script:TenantId -CloudConfiguration $script:CommercialCloud -Force
 
         $result.Success | Should -BeFalse
-        $result.Detail  | Should -Match 'Web Account Manager'
         $result.Detail  | Should -Match 'device code'
         $result.Detail  | Should -Match '2\.25\.0'
     }

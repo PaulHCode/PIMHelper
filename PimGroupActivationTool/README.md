@@ -169,13 +169,22 @@ the run. Use `-NoLog` to turn it off deliberately.
 
 ## Troubleshooting
 
-**"Microsoft Graph reported no error but left no sign-in context"**
+**Sign-in falls back to a device code on its own**
 On Windows the Graph SDK signs in through the Web Account Manager (WAM) broker, which
 needs a usable parent window. In an embedded terminal, over a remote session, or when
 the broker crashes, it can fail without raising an error, and `Connect-MgGraph` returns
 leaving `Get-MgContext` null. Microsoft.Graph.Authentication 2.25.0 and earlier swallow
-this completely, which is why 2.26.0 is the minimum version. Re-run with
-`-UseDeviceAuthentication`; device code skips WAM entirely and works in any terminal.
+this completely, which is why 2.26.0 is the minimum version.
+
+Rather than stopping there, the tool notices the empty context and retries once with a
+device code, which needs no window. You will see a warning in the log and then a code to
+enter. Nothing is approved on your behalf — the code is yours to enter, and you still
+sign in yourself. Pass `-UseDeviceAuthentication` to skip the broker attempt entirely.
+
+**"Microsoft Graph reported no error but left no sign-in context, with or without a device code"**
+Both sign-in methods came back empty, so this is not the broker. Check that
+Microsoft.Graph.Authentication is installed and importable; the installed version is
+named in the message.
 
 **"Unable to switch to a single-threaded apartment"**
 WinForms needs STA and PowerShell 7 starts MTA on Windows. The script relaunches itself

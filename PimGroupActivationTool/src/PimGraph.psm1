@@ -676,6 +676,88 @@ function Test-PimConnectSupportsLoginHint {
     }
 }
 
+function Invoke-PimGraphSignIn {
+    <#
+    .SYNOPSIS
+        Signs in to Microsoft Graph, falling back to a device code when the sign-in
+        broker fails without saying so.
+
+    .DESCRIPTION
+        Connect-MgGraph can return without raising an error and still leave no
+        context behind. On Windows that is almost always the Web Account Manager
+        broker failing because it has no usable parent window to show a prompt in -
+        which happens in remote sessions, embedded terminals, and service accounts.
+        Older module versions swallow the failure entirely.
+
+        A device code needs no window, so rather than making the user discover the
+        workaround and start over, this retries once with one automatically. The
+        user stays in control: the code is theirs to enter, and nothing is approved
+        on their behalf.
+
+    .PARAMETER ConnectParameters
+        Parameters to splat into Connect-MgGraph. Not modified; a copy is used.
+
+    .PARAMETER UseDeviceAuthentication
+        Use a device code from the outset and do not attempt the broker at all.
+
+    .OUTPUTS
+        An object with Context and UsedDeviceCode.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [hashtable] $ConnectParameters,
+
+        [Parameter()]
+        [switch] $UseDeviceAuthentication
+    )
+
+    $broker = @{}
+    foreach ($key in $ConnectParameters.Keys) { $broker[$key] = $ConnectParameters[$key] }
+    if ($UseDeviceAuthentication) { $broker['UseDeviceCode'] = $true }
+
+    $null = Invoke-PimExternalCommand -Name 'Connect-MgGraph' -Parameters $broker
+
+    $context = Get-PimGraphContext
+    if ($null -ne $context) {
+        return [pscustomobject]@{
+            Context        = $context
+            UsedDeviceCode = [bool]$UseDeviceAuthentication
+        }
+    }
+
+    if ($UseDeviceAuthentication) {
+        throw ('Microsoft Graph reported no error but left no sign-in context, even with device code ' +
+               'authentication. Make sure Microsoft.Graph.Authentication is up to date ' +
+               "(installed: $(Get-PimGraphAuthenticationVersion)).")
+    }
+
+    Write-PimLog -Level Warning -Operation 'Connect-Graph' -Status 'BrokerUnavailable' `
+        -Message ('Microsoft Graph reported no error but left no sign-in context, which means the ' +
+                  'Web Account Manager broker could not show a sign-in prompt. Retrying with a device code.')
+
+    # Built fresh rather than by adding to the hashtable above, which was handed
+    # to the first call and must keep describing what that call actually asked for.
+    $deviceCode = @{}
+    foreach ($key in $ConnectParameters.Keys) { $deviceCode[$key] = $ConnectParameters[$key] }
+    $deviceCode['UseDeviceCode'] = $true
+
+    $null = Invoke-PimExternalCommand -Name 'Connect-MgGraph' -Parameters $deviceCode
+
+    $context = Get-PimGraphContext
+    if ($null -eq $context) {
+        throw ('Microsoft Graph reported no error but left no sign-in context, with or without a device code. ' +
+               'Make sure Microsoft.Graph.Authentication is up to date ' +
+               "(installed: $(Get-PimGraphAuthenticationVersion)).")
+    }
+
+    [pscustomobject]@{
+        Context        = $context
+        UsedDeviceCode = $true
+    }
+}
+
 function Connect-PimGraphTenant {
     <#
     .SYNOPSIS
@@ -749,6 +831,8 @@ function Connect-PimGraphTenant {
     )
 
     $lastError = $null
+    # Set once the broker has proven it cannot show a sign-in prompt.
+    $brokerUnusable = $false
 
     foreach ($attempt in $attempts) {
         if ($attempt.IsFallback -and (Compare-PimScopeSet -Left $attempt.Scopes -Right $Scopes)) {
@@ -774,19 +858,12 @@ function Connect-PimGraphTenant {
                 $connectParameters['LoginHint'] = $ExpectedAccount
             }
 
-            $null = Invoke-PimExternalCommand -Name 'Connect-MgGraph' -Parameters $connectParameters
-
-            $context = Get-PimGraphContext
-            if ($null -eq $context) {
-                # Connect-MgGraph can return without raising an error and still
-                # leave no context. On Windows this is almost always the Web
-                # Account Manager broker failing when it has no usable parent
-                # window, which older module versions swallow silently.
-                throw ('Microsoft Graph reported no error but left no sign-in context. ' +
-                       'This usually means the Web Account Manager broker could not display a sign-in prompt. ' +
-                       'Retry with device code authentication, and make sure Microsoft.Graph.Authentication is up to date ' +
-                       "(installed: $(Get-PimGraphAuthenticationVersion)).")
-            }
+            # Once the broker has proven unusable there is no point letting a later
+            # attempt fail the same way, so stay on device code for the rest of the run.
+            $signIn = Invoke-PimGraphSignIn -ConnectParameters $connectParameters `
+                -UseDeviceAuthentication:($UseDeviceAuthentication -or $brokerUnusable)
+            if ($signIn.UsedDeviceCode) { $brokerUnusable = $true }
+            $context = $signIn.Context
 
             if (-not (Test-PimGraphContext -Context $context -TenantId $TenantId -GraphEnvironment $graphEnvironment)) {
                 $actualTenant = Get-PimPropertyValue -InputObject $context -Name 'TenantId'
@@ -1644,6 +1721,7 @@ function Get-PimActiveGroupAssignment {
 }
 
 Export-ModuleMember -Function @(
+    'Invoke-PimGraphSignIn'
     'Get-PimDefaultGraphScope'
     'Get-PimMinimumGraphScope'
     'Set-PimCommandOverride'
