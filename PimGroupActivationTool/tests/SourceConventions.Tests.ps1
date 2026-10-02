@@ -191,8 +191,85 @@ Describe 'Source conventions' {
         }
     }
 
-    It 'never writes a secret-bearing value directly to the log' {
+    It 'only displays columns the producing function actually emits' {
+        # A Select-Object naming a property that is never set prints a blank column
+        # rather than failing, so the output silently loses a field. -ListActive
+        # shipped exactly that way: it asked for a group name the function did not
+        # emit, and the table came out as a wall of GUIDs.
+        $producers = @{
+            'allActive' = 'Get-PimActiveGroupAssignment'
+            'allGroups' = 'Get-PimEligibleGroups'
+        }
+
+        $emitted = @{}
+        $functionAsts = @{}
         foreach ($file in $script:SourceFiles) {
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$null)
+            foreach ($function in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+                $functionAsts[$function.Name] = $function
+
+                $keys = New-Object System.Collections.Generic.List[string]
+                $casts = $function.FindAll({ param($n)
+                    $n -is [System.Management.Automation.Language.ConvertExpressionAst] -and
+                    $n.Type.TypeName.Name -match '^(pscustomobject|psobject)$' -and
+                    $n.Child -is [System.Management.Automation.Language.HashtableAst] }, $true)
+
+                foreach ($cast in $casts) {
+                    foreach ($pair in $cast.Child.KeyValuePairs) { $keys.Add([string]$pair.Item1.Value) }
+                }
+
+                $emitted[$function.Name] = $keys
+            }
+        }
+
+        # Most queries hand record construction to a New-Pim*Record factory, so the
+        # properties live one call away from the function the caller names.
+        foreach ($name in @($functionAsts.Keys)) {
+            foreach ($call in $functionAsts[$name].FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)) {
+                $called = $call.GetCommandName()
+                if ($called -and $called -match '^New-Pim.*Record$' -and $emitted.ContainsKey($called)) {
+                    foreach ($key in $emitted[$called]) { $emitted[$name].Add($key) }
+                }
+            }
+        }
+
+        $entryAst = [System.Management.Automation.Language.Parser]::ParseFile($script:EntryScript.FullName, [ref]$null, [ref]$null)
+        $checked = 0
+        $offenders = New-Object System.Collections.Generic.List[string]
+
+        foreach ($pipeline in $entryAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.PipelineAst] }, $true)) {
+            $first = $pipeline.PipelineElements[0]
+            if ($first -isnot [System.Management.Automation.Language.CommandExpressionAst]) { continue }
+            if ($first.Expression -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
+
+            $producer = $producers[$first.Expression.VariablePath.UserPath]
+            if (-not $producer) { continue }
+
+            foreach ($element in $pipeline.PipelineElements) {
+                if ($element -isnot [System.Management.Automation.Language.CommandAst]) { continue }
+                if ($element.GetCommandName() -ne 'Select-Object') { continue }
+
+                $columns = $element.CommandElements |
+                    Where-Object { $_ -is [System.Management.Automation.Language.ArrayLiteralAst] } |
+                    ForEach-Object { $_.Elements } |
+                    Where-Object { $_ -is [System.Management.Automation.Language.StringConstantExpressionAst] } |
+                    ForEach-Object { [string]$_.Value }
+
+                foreach ($column in $columns) {
+                    $checked++
+                    if ($emitted[$producer] -notcontains $column) {
+                        $offenders.Add("$($script:EntryScript.Name):$($element.Extent.StartLineNumber) $producer never emits '$column'")
+                    }
+                }
+            }
+        }
+
+        # Without this the lint quietly becomes a no-op the moment a variable is renamed.
+        $checked | Should -BeGreaterThan 0 -Because 'the lint must actually find columns to check'
+        $offenders -join "`n" | Should -BeNullOrEmpty -Because 'a column with no matching property prints blank instead of failing'
+    }
+
+    It 'never writes a secret-bearing value directly to the log' {        foreach ($file in $script:SourceFiles) {
             foreach ($line in (Get-Content -LiteralPath $file.FullName)) {
                 $line | Should -Not -Match 'Write-PimLog.*\$(accessToken|AccessToken|token|Token|secret|Secret|password|Password)\b'
             }
