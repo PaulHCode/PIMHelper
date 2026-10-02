@@ -400,6 +400,10 @@ $script:SubmitWorker = {
         }
 
         try {
+            # The connection result carries no principal ID, and the guest object ID
+            # differs in every directory, so resolve it once per tenant.
+            $me = Get-CurrentGraphUser -GraphBaseUri $CloudConfiguration.GraphBaseUri
+
             foreach ($item in $tenantGroup.Group) {
                 if ($Shared.CancelRequested) {
                     $results.Add((New-PimActivationResultRecord `
@@ -423,7 +427,7 @@ $script:SubmitWorker = {
                     -TenantDisplayName $tenantName `
                     -GroupId $item.GroupId `
                     -GroupDisplayName $item.GroupDisplayName `
-                    -PrincipalId $(if ($item.PrincipalId) { $item.PrincipalId } else { $connection.PrincipalId }) `
+                    -PrincipalId $(if ($item.PrincipalId) { $item.PrincipalId } else { $me.Id }) `
                     -AccessId $item.AccessId `
                     -Justification $Justification `
                     -Duration $Duration `
