@@ -469,6 +469,21 @@ Describe 'Connect-PimGraphTenant' {
         }
     }
 
+    It 'does not ask Graph who it is when there is no account to check against' {
+        # Headless list modes connect without an expected account. Resolving the
+        # principal there would cost a network round-trip per tenant for nothing.
+        Set-PimCommandOverride -Name 'Get-MgContext' -Handler { param($p)
+            [pscustomobject]@{ TenantId = '11111111-1111-1111-1111-111111111111'; Environment = 'Global'; Account = ''; Scopes = (Get-PimMinimumGraphScope) }
+        }
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p) throw 'Graph should not be called.' }
+        Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) throw 'Should have reused the session.' }
+
+        $result = Connect-PimGraphTenant -TenantId $script:TenantId -CloudConfiguration $script:CommercialCloud
+
+        $result.Success | Should -BeTrue
+        $result.Message | Should -Match 'Reused'
+    }
+
     It 'connects with the full scope set and the correct environment' {
         Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) $script:ConnectParameters = $p }
         Set-PimCommandOverride -Name 'Get-MgContext' -Handler { param($p)

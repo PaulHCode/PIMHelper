@@ -647,9 +647,15 @@ function Connect-PimGraphTenant {
         $existing = Get-PimGraphContext
         if (Test-PimGraphContext -Context $existing -TenantId $TenantId -GraphEnvironment $graphEnvironment -RequiredScopes $FallbackScopes) {
             # The account is checked separately because establishing it may need a
-            # Graph call, which Test-PimGraphContext deliberately cannot make.
-            $existingAccount = Resolve-PimContextAccount -Context $existing -GraphBaseUri $CloudConfiguration.GraphBaseUri
-            if (Test-PimAccountMatch -Expected $ExpectedAccount -Actual $existingAccount) {
+            # Graph call, which Test-PimGraphContext deliberately cannot make. That
+            # call is only worth making when there is an account to check against.
+            $accountMatches = $true
+            if (-not [string]::IsNullOrWhiteSpace($ExpectedAccount)) {
+                $existingAccount = Resolve-PimContextAccount -Context $existing -GraphBaseUri $CloudConfiguration.GraphBaseUri
+                $accountMatches = Test-PimAccountMatch -Expected $ExpectedAccount -Actual $existingAccount
+            }
+
+            if ($accountMatches) {
                 $grantedScopes = @(Get-PimPropertyValue -InputObject $existing -Name 'Scopes')
                 Write-PimLog -Operation 'Connect-Graph' -TenantId $TenantId -Status 'Reused' -Message 'Reusing the existing Microsoft Graph context.'
                 return (New-PimGraphConnectionResult -Success $true -TenantId $TenantId -Context $existing -Scopes $grantedScopes -Message 'Reused the existing Microsoft Graph session.')
