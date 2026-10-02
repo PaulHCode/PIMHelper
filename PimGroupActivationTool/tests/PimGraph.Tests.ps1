@@ -242,6 +242,35 @@ Describe 'Connect-PimAzureAccount' {
 }
 
 Describe 'Get-PimAuthorizedTenant' {
+    It 'says why a tenant is listed by ID instead of by name' {
+        # Exactly what the live run produced: Azure could not mint a token for the
+        # tenant, so Get-AzTenant returned a bare object. Falling back to the GUID
+        # is right, but silently doing so looks like the tool is broken rather than
+        # the Azure sign-in being stale.
+        Set-PimCommandOverride -Name 'Get-AzTenant' -Handler { param($p)
+            @([pscustomobject]@{ TenantId = '33333333-3333-3333-3333-333333333333' })
+        }
+
+        $warnings = @()
+        $tenants = Get-PimAuthorizedTenant -CloudConfiguration $script:CommercialCloud -WarningVariable warnings -WarningAction SilentlyContinue
+
+        $tenants.Count                | Should -Be 1
+        $tenants[0].TenantDisplayName | Should -Be '33333333-3333-3333-3333-333333333333'
+        "$warnings"                   | Should -Match 'Connect-AzAccount'
+    }
+
+    It 'stays quiet when every tenant resolved a real name' {
+        Set-PimCommandOverride -Name 'Get-AzTenant' -Handler { param($p)
+            @([pscustomobject]@{ TenantId = '44444444-4444-4444-4444-444444444444'; Name = 'Contoso'; Domains = @('contoso.com') })
+        }
+
+        $warnings = @()
+        $tenants = Get-PimAuthorizedTenant -CloudConfiguration $script:CommercialCloud -WarningVariable warnings -WarningAction SilentlyContinue
+
+        $tenants[0].TenantDisplayName | Should -Be 'Contoso'
+        "$warnings"                   | Should -Not -Match 'Connect-AzAccount'
+    }
+
     It 'normalizes and sorts discovered tenants' {
         Set-PimCommandOverride -Name 'Get-AzTenant' -Handler { param($p)
             @(

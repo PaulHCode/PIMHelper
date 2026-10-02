@@ -434,6 +434,17 @@ function Get-PimAuthorizedTenant {
     }
 
     $sorted = @($records | Sort-Object -Property TenantDisplayName)
+
+    # Get-AzTenant returns a bare tenant when Azure cannot mint a token for it, so
+    # the record falls back to the GUID. That looks like a broken tool rather than
+    # a stale Azure sign-in, and the raw Azure warning does not say what to do.
+    $unnamed = @($sorted | Where-Object { $_.TenantDisplayName -eq $_.TenantId })
+    if ($unnamed.Count -gt 0) {
+        Write-PimLog -Level Warning -Operation 'Get-Tenants' -Message "$($unnamed.Count) tenant(s) resolved to an ID only."
+        Write-Warning ("Could not read the name or domain for $($unnamed.Count) of $($sorted.Count) tenant(s), so they are listed by ID. " +
+            'This usually means the Azure sign-in has expired. Run Connect-AzAccount to refresh it. Activation itself is unaffected.')
+    }
+
     Write-PimLog -Operation 'Get-Tenants' -Status 'Succeeded' -Message "Discovered $($sorted.Count) authorized tenant(s)."
     return , ([object[]]$sorted)
 }
