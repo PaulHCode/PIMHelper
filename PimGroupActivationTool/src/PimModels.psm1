@@ -1156,6 +1156,86 @@ function Test-PimJustification {
     return ($Justification.Trim().Length -ge $MinimumLength)
 }
 
+function ConvertTo-PimHomeAccountName {
+    <#
+    .SYNOPSIS
+        Reduces a B2B guest user principal name to the home account it was minted from.
+
+    .DESCRIPTION
+        When a user is invited into another tenant, Entra stores them under a
+        deterministic external UPN: ada@contoso.com becomes
+        ada_contoso.com#EXT#@fabrikam.onmicrosoft.com. Folding that back to the
+        home form lets one account be compared across tenants.
+
+        Anything that is not in the external form is returned unchanged, so a
+        plain UPN is its own home name.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter()]
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $Account
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Account)) { return '' }
+
+    $value = $Account.Trim()
+    $marker = $value.IndexOf('#EXT#', [System.StringComparison]::OrdinalIgnoreCase)
+    if ($marker -lt 0) { return $value }
+
+    # Everything before the marker is the mangled home UPN, whose final
+    # underscore stands in for the '@'. Domains cannot contain '_', so the last
+    # underscore is unambiguous even when the local part has its own.
+    $mangled = $value.Substring(0, $marker)
+    $split = $mangled.LastIndexOf('_')
+    if ($split -le 0 -or $split -eq ($mangled.Length - 1)) { return $value }
+
+    return $mangled.Substring(0, $split) + '@' + $mangled.Substring($split + 1)
+}
+
+function Test-PimAccountMatch {
+    <#
+    .SYNOPSIS
+        Returns $true when two account names identify the same person.
+
+    .DESCRIPTION
+        The tool compares the account it signed in to Azure with against the
+        account on a Microsoft Graph context. In a tenant the user is a guest of,
+        those two strings are legitimately different spellings of one identity:
+        Azure reports the home UPN and Graph reports the B2B external UPN. A
+        literal comparison would reject the valid sessions this tool exists to
+        create, so both sides are folded to their home form first.
+
+        An absent name on either side means the comparison cannot be made at all,
+        which is reported as a match rather than a false accusation. A Graph
+        context built from a caller-supplied access token, for example, carries no
+        account.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter()]
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $Expected,
+
+        [Parameter()]
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $Actual
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Expected)) { return $true }
+    if ([string]::IsNullOrWhiteSpace($Actual)) { return $true }
+
+    $left  = ConvertTo-PimHomeAccountName -Account $Expected
+    $right = ConvertTo-PimHomeAccountName -Account $Actual
+
+    return [string]::Equals($left, $right, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
 function Get-PimSubmissionReadiness {
     <#
     .SYNOPSIS
@@ -1383,6 +1463,8 @@ Export-ModuleMember -Function @(
     'ConvertTo-PimErrorText'
     'ConvertTo-PimExceptionText'
     'Test-PimJustification'
+    'ConvertTo-PimHomeAccountName'
+    'Test-PimAccountMatch'
     'Get-PimSubmissionReadiness'
     'Get-PimUiState'
     'Test-PimUiStateTransition'

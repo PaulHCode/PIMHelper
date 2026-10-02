@@ -518,9 +518,11 @@ function Test-PimGraphContext {
 
     # A stale context can belong to a different signed-in user after an account
     # switch, which would silently enumerate somebody else's eligible groups.
+    # The two names are compared by home identity because Azure reports the home
+    # UPN while Graph reports the B2B external UPN in a tenant the user guests in.
     if (-not [string]::IsNullOrWhiteSpace($ExpectedAccount)) {
         $contextAccount = Get-PimPropertyValue -InputObject $Context -Name 'Account'
-        if (-not [string]::Equals([string]$contextAccount, $ExpectedAccount, [System.StringComparison]::OrdinalIgnoreCase)) {
+        if (-not (Test-PimAccountMatch -Expected $ExpectedAccount -Actual ([string]$contextAccount))) {
             return $false
         }
     }

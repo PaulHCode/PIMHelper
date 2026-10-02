@@ -331,6 +331,43 @@ Describe 'Test-PimGraphContext' {
             Test-PimGraphContext -Context $script:GoodContext -TenantId $script:TenantId -GraphEnvironment 'Global' -ExpectedAccount $expected | Should -BeTrue
         }
     }
+
+    It 'accepts the signed-in account against its B2B spelling in a guest tenant' {
+        # Azure reports the home UPN and Graph reports the external UPN, so a
+        # literal comparison would reject every cross-tenant session the tool makes.
+        $guest = [pscustomobject]@{
+            TenantId    = $script:TenantId
+            Environment = 'Global'
+            Account     = 'ada_contoso.com#EXT#@fabrikam.onmicrosoft.com'
+            Scopes      = @()
+        }
+        Test-PimGraphContext -Context $guest -TenantId $script:TenantId -GraphEnvironment 'Global' -ExpectedAccount 'ada@contoso.com' |
+            Should -BeTrue
+    }
+
+    It 'still rejects a different guest from another home tenant' {
+        $other = [pscustomobject]@{
+            TenantId    = $script:TenantId
+            Environment = 'Global'
+            Account     = 'ada_northwind.com#EXT#@fabrikam.onmicrosoft.com'
+            Scopes      = @()
+        }
+        Test-PimGraphContext -Context $other -TenantId $script:TenantId -GraphEnvironment 'Global' -ExpectedAccount 'ada@contoso.com' |
+            Should -BeFalse
+    }
+
+    It 'accepts a context that carries no account at all' {
+        # Connect-MgGraph -AccessToken produces exactly this: the scopes come from
+        # the token but Account is blank, so there is nothing to compare.
+        $tokenContext = [pscustomobject]@{
+            TenantId    = $script:TenantId
+            Environment = 'Global'
+            Account     = ''
+            Scopes      = @()
+        }
+        Test-PimGraphContext -Context $tokenContext -TenantId $script:TenantId -GraphEnvironment 'Global' -ExpectedAccount 'ada@contoso.com' |
+            Should -BeTrue
+    }
 }
 
 Describe 'Connect-PimGraphTenant' {

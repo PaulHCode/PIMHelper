@@ -723,6 +723,84 @@ Describe 'Format-PimGraphError' {
     }
 }
 
+Describe 'ConvertTo-PimHomeAccountName' {
+    It 'leaves a plain user principal name alone' {
+        ConvertTo-PimHomeAccountName -Account 'ada@contoso.com' | Should -Be 'ada@contoso.com'
+    }
+
+    It 'folds a B2B guest name back to the home account' {
+        ConvertTo-PimHomeAccountName -Account 'ada_contoso.com#EXT#@fabrikam.onmicrosoft.com' |
+            Should -Be 'ada@contoso.com'
+    }
+
+    It 'splits on the last underscore so an underscore in the local part survives' {
+        ConvertTo-PimHomeAccountName -Account 'ada_lovelace_contoso.com#EXT#@fabrikam.onmicrosoft.com' |
+            Should -Be 'ada_lovelace@contoso.com'
+    }
+
+    It 'trims surrounding whitespace' {
+        ConvertTo-PimHomeAccountName -Account '  ada@contoso.com  ' | Should -Be 'ada@contoso.com'
+    }
+
+    It 'returns an empty string for <name>' -ForEach @(
+        @{ Name = 'null';       Value = $null }
+        @{ Name = 'empty';      Value = '' }
+        @{ Name = 'whitespace'; Value = '   ' }
+    ) {
+        ConvertTo-PimHomeAccountName -Account $Value | Should -Be ''
+    }
+
+    It 'returns the original when the marker has no usable prefix' {
+        # Nothing to rebuild from, so guessing would be worse than passing it through.
+        ConvertTo-PimHomeAccountName -Account '#EXT#@fabrikam.onmicrosoft.com' |
+            Should -Be '#EXT#@fabrikam.onmicrosoft.com'
+        ConvertTo-PimHomeAccountName -Account 'nounderscore#EXT#@fabrikam.onmicrosoft.com' |
+            Should -Be 'nounderscore#EXT#@fabrikam.onmicrosoft.com'
+    }
+}
+
+Describe 'Test-PimAccountMatch' {
+    It 'matches an identical name regardless of case' {
+        Test-PimAccountMatch -Expected 'Ada@Contoso.com' -Actual 'ada@contoso.com' | Should -BeTrue
+    }
+
+    It 'matches the home account against its B2B guest spelling' {
+        # This is the tool's whole purpose: Azure reports the home UPN while Graph
+        # reports the external UPN for the very same person.
+        Test-PimAccountMatch -Expected 'ada@contoso.com' -Actual 'ada_contoso.com#EXT#@fabrikam.onmicrosoft.com' |
+            Should -BeTrue
+    }
+
+    It 'matches in the other direction too' {
+        Test-PimAccountMatch -Expected 'ada_contoso.com#EXT#@fabrikam.onmicrosoft.com' -Actual 'ada@contoso.com' |
+            Should -BeTrue
+    }
+
+    It 'matches the same guest across two different tenants' {
+        Test-PimAccountMatch -Expected 'ada_contoso.com#EXT#@fabrikam.onmicrosoft.com' `
+            -Actual 'ada_contoso.com#EXT#@northwind.onmicrosoft.com' | Should -BeTrue
+    }
+
+    It 'rejects a genuinely different person' {
+        Test-PimAccountMatch -Expected 'ada@contoso.com' -Actual 'grace@contoso.com' | Should -BeFalse
+    }
+
+    It 'rejects a different person invited from another tenant' {
+        Test-PimAccountMatch -Expected 'ada@contoso.com' -Actual 'ada_northwind.com#EXT#@fabrikam.onmicrosoft.com' |
+            Should -BeFalse
+    }
+
+    It 'cannot accuse when <side> is unknown' -ForEach @(
+        @{ Side = 'the expected account'; Expected = '';                Actual = 'ada@contoso.com' }
+        @{ Side = 'the actual account';   Expected = 'ada@contoso.com'; Actual = '' }
+        @{ Side = 'both accounts';        Expected = '';                Actual = '' }
+    ) {
+        # A Graph context built from a caller-supplied token carries no account.
+        # Reporting a mismatch there would be a false accusation.
+        Test-PimAccountMatch -Expected $Expected -Actual $Actual | Should -BeTrue
+    }
+}
+
 Describe 'Test-PimJustification' {
     It 'rejects <Description>' -ForEach @(
         @{ Description = 'null';       Value = $null }
