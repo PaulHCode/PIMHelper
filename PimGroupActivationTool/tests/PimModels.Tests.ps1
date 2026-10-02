@@ -660,6 +660,29 @@ Describe 'Format-PimGraphError' {
             Should -Match 'ticket information'
     }
 
+    # PIM reports every unmet activation-policy rule under one umbrella code, so
+    # the specific cause is only in the message. Reading the code alone would tell
+    # a user who is missing a ticket number to shorten their duration instead.
+    It 'reads past the umbrella policy code to <Expected>' -ForEach @(
+        @{ Expected = 'ticket information';      GraphMessage = 'Ticket information is required by the policy.' }
+        @{ Expected = 'requires a justification'; GraphMessage = 'A justification is required by the assignment policy.' }
+        @{ Expected = 'already exists';           GraphMessage = 'The role assignment already exists for this principal.' }
+        @{ Expected = 'requires approval';        GraphMessage = 'The request requires approval before it can be activated.' }
+        @{ Expected = 'duration exceeds';         GraphMessage = 'The duration specified exceeds the maximum allowed.' }
+    ) {
+        $raw = '{"error":{"code":"RoleAssignmentRequestPolicyValidationFailed","message":"' + $GraphMessage + '"}}'
+        (Format-PimGraphError -ErrorObject $raw).FriendlyMessage | Should -Match $Expected
+    }
+
+    It 'surfaces the policy message verbatim when no specific rule recognises it' {
+        $raw = '{"error":{"code":"RoleAssignmentRequestPolicyValidationFailed","message":"Rule MfaRule was not satisfied."}}'
+        $friendly = (Format-PimGraphError -ErrorObject $raw).FriendlyMessage
+
+        $friendly | Should -Match 'activation policy rejected'
+        $friendly | Should -Match 'MfaRule was not satisfied'
+        $friendly | Should -Not -Match 'shorter duration'
+    }
+
     It 'maps throttling' {
         (Format-PimGraphError -ErrorObject 'Response status code does not indicate success: 429 (TooManyRequests)').FriendlyMessage |
             Should -Match 'throttled'

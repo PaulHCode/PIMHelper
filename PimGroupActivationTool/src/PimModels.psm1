@@ -963,10 +963,21 @@ $script:FriendlyErrorRules = @(
     @{ Pattern = '(?i)AADSTS50020|AADSTS700016|user account .* does not exist in tenant|does not exist in tenant'; Message = 'Your account does not have access to this tenant. Confirm the B2B guest invitation was accepted.' }
     @{ Pattern = '(?i)AADSTS50058|AADSTS50001|AADSTS90002'; Message = 'Sign-in could not be completed for this tenant. Verify the tenant ID and that the Microsoft Graph PowerShell application is available there.' }
     @{ Pattern = '(?i)\bAuthenticationCanceled\b|user_?cancel|canceled by the user|was canceled'; Message = 'Sign-in was cancelled.' }
-    @{ Pattern = '(?i)RoleAssignmentRequestPolicyValidationFailed|exceeds.*maximum|maximum.*duration|duration.*(exceed|not allowed|longer)'; Message = 'The requested duration exceeds the activation policy for this group. Choose a shorter duration.' }
+
+    # RoleAssignmentRequestPolicyValidationFailed is PIM's umbrella code for any
+    # unmet activation-policy rule, so the specific causes have to be recognised
+    # before it. Matching the bare code first would tell a user who is missing a
+    # ticket number to shorten their duration, which can never succeed.
+    @{ Pattern = '(?i)RoleAssignmentExists|RoleAssignmentRequestPolicyValidationFailed.*already|already active|PendingRoleAssignmentRequest|existing.*request'; Message = 'An active or pending activation already exists for this group.' }
     @{ Pattern = '(?i)ticket.*(required|information)|RoleAssignmentRequestTicketInfo'; Message = 'This group''s activation policy requires ticket information. Provide a ticket number and ticket system, then resubmit.' }
     @{ Pattern = '(?i)justification.*(required|missing)'; Message = 'This group''s activation policy requires a justification. Provide one and resubmit.' }
-    @{ Pattern = '(?i)RoleAssignmentExists|RoleAssignmentRequestPolicyValidationFailed.*already|already active|PendingRoleAssignmentRequest|existing.*request'; Message = 'An active or pending activation already exists for this group.' }
+    @{ Pattern = '(?i)approv'; Message = 'This group''s activation policy requires approval. The request was not completed; an approver must act on it.' }
+    @{ Pattern = '(?i)RoleAssignmentRequestPolicyValidationFailed.*(duration|expiration|maximum)|exceeds.*maximum|maximum.*duration|duration.*(exceed|not allowed|longer)'; Message = 'The requested duration exceeds the activation policy for this group. Choose a shorter duration.' }
+
+    # Anything else the policy rejects. The raw text is the only clue to which
+    # rule failed, so it is surfaced rather than replaced with a guess.
+    @{ Pattern = '(?i)RoleAssignmentRequestPolicyValidationFailed'; Message = 'This group''s activation policy rejected the request.'; IncludeDetail = $true }
+
     @{ Pattern = '(?i)RoleNotEligible|not eligible|NoEligibleAssignment'; Message = 'You are not eligible for this group, or the eligibility has expired.' }
     @{ Pattern = '(?i)\b429\b|TooManyRequests|throttl'; Message = 'Microsoft Graph throttled the request. Wait a moment and try again.' }
     @{ Pattern = '(?i)\b(401|Unauthorized|InvalidAuthenticationToken)\b'; Message = 'The Microsoft Graph session is not valid for this tenant. Sign in again.' }
@@ -1029,22 +1040,26 @@ function Format-PimGraphError {
         if ($code) { $haystack = "$code $haystack" }
         if ($statusCode) { $haystack = "$statusCode $haystack" }
 
+        # The Graph "message" value, which usually names the rule that failed.
+        $graphMessage = ''
+        $messageMatch = [regex]::Match($raw, '(?i)"message"\s*:\s*"(?<message>(?:[^"\\]|\\.)*)"')
+        if ($messageMatch.Success) {
+            $graphMessage = ($messageMatch.Groups['message'].Value -replace '\\"', '"' -replace '\\n', ' ').Trim()
+        }
+
         foreach ($rule in $script:FriendlyErrorRules) {
             if ([regex]::IsMatch($haystack, $rule.Pattern)) {
                 $friendly = $rule.Message
+                if ($rule.ContainsKey('IncludeDetail') -and $rule.IncludeDetail -and $graphMessage) {
+                    $friendly = "$friendly $graphMessage"
+                }
                 break
             }
         }
 
         if (-not $friendly) {
             # Fall back to the Graph error message, which is usually readable.
-            $messageMatch = [regex]::Match($raw, '(?i)"message"\s*:\s*"(?<message>(?:[^"\\]|\\.)*)"')
-            if ($messageMatch.Success) {
-                $friendly = $messageMatch.Groups['message'].Value -replace '\\"', '"' -replace '\\n', ' '
-            }
-            else {
-                $friendly = $raw
-            }
+            if ($graphMessage) { $friendly = $graphMessage } else { $friendly = $raw }
         }
 
         if ([string]::IsNullOrWhiteSpace($friendly)) { $friendly = 'An unknown error occurred.' }
