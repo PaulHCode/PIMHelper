@@ -288,7 +288,13 @@ if (-not $cloudConfiguration.IsSupported) {
 if ($isGui) {
     $logState = Get-PimLogState
     Show-PimMainForm -CloudName $cloudConfiguration.DisplayName -LogDirectory $logState.Directory
-    exit 0
+
+    # Not `exit 0`. If the user closed the window while an interactive sign-in
+    # prompt was still up, that worker is a foreground thread that ignores Stop()
+    # until the broker gives up, and a normal exit waits for it. The window would
+    # vanish while pwsh.exe stayed resident, still holding the auth listener. The
+    # UI is gone and there is nothing left to finish, so end the process outright.
+    [Environment]::Exit(0)
 }
 
 # ---------------------------------------------------------------------------

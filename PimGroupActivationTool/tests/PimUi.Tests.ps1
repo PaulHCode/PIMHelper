@@ -76,6 +76,75 @@ Describe 'Stop-PimUiOperation' {
     }
 }
 
+Describe 'GUI shutdown' {
+    BeforeAll {
+        $script:EntryScript = Join-Path -Path (Split-Path -Parent $PSScriptRoot) -ChildPath 'Start-PimGroupActivationTool.ps1'
+
+        # Reproduces what the tool leaves behind when the user closes the window
+        # during an interactive sign-in: a pipeline that ignores Stop(), asked to
+        # stop and then abandoned, exactly as Stop-PimUiOperation leaves it.
+        function Measure-PimShutdownSeconds {
+            param([string] $ExitStatement)
+
+            $body = @'
+$rs = [runspacefactory]::CreateRunspace()
+$rs.Open()
+$ps = [powershell]::Create()
+$ps.Runspace = $rs
+$null = $ps.AddScript('[System.Threading.Thread]::Sleep(8000)')
+$null = $ps.BeginInvoke()
+Start-Sleep -Milliseconds 400
+$null = $ps.BeginStop($null, $null)
+__EXIT__
+'@
+            $path = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ("PimShutdown-" + [guid]::NewGuid().ToString('N') + ".ps1")
+            Set-Content -LiteralPath $path -Encoding UTF8 -Value $body.Replace('__EXIT__', $ExitStatement)
+
+            try {
+                $started = Get-Date
+                $process = Start-Process -FilePath 'pwsh' -ArgumentList @('-NoProfile', '-STA', '-File', $path) -PassThru -WindowStyle Hidden
+                $null = $process.WaitForExit(20000)
+                if (-not $process.HasExited) { $process.Kill() }
+                return ((Get-Date) - $started).TotalSeconds
+            }
+            finally {
+                Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    It 'confirms a plain exit is held up by the abandoned worker' {
+        # The control. Without this, the test below would pass even if the hazard
+        # it guards against had never existed.
+        Measure-PimShutdownSeconds -ExitStatement 'exit 0' |
+            Should -BeGreaterThan 4 -Because 'a runspace pipeline thread is a foreground thread, so it vetoes a normal exit'
+    }
+
+    It 'ends the process outright so a stuck sign-in cannot keep it alive' {
+        Measure-PimShutdownSeconds -ExitStatement '[Environment]::Exit(0)' |
+            Should -BeLessThan 4 -Because 'the window is gone, so the user must not be left with a resident pwsh.exe'
+    }
+
+    It 'uses that exit in the entry script''s GUI branch' {
+        # Scoped to the GUI branch on purpose: the headless modes return through a
+        # normal `exit`, and should, because they have no abandoned worker.
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:EntryScript, [ref]$null, [ref]$null)
+        $guiBranch = $ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.IfStatementAst] -and
+                $node.Clauses[0].Item1.Extent.Text -match '^\$isGui$' -and
+                $node.Clauses[0].Item2.Extent.Text -match 'Show-PimMainForm'
+            }, $true)
+
+        @($guiBranch).Count | Should -Be 1
+        $body = $guiBranch[0].Clauses[0].Item2.Extent.Text
+
+        $body | Should -Match 'Show-PimMainForm'
+        $body | Should -Match '\[Environment\]::Exit\(0\)'
+        $body | Should -Not -Match '(?m)^\s*exit\b'
+    }
+}
+
 Describe 'New-PimSharedState' {
     It 'creates a synchronized hashtable with the progress fields' {
         $shared = New-PimSharedState
