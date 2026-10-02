@@ -21,7 +21,7 @@ Entra tenant.
 | Windows | WinForms is Windows-only. The headless modes still need Windows for `Az.Accounts` interactive sign-in. |
 | PowerShell 7.2+ | PowerShell 5.1 also works. |
 | `Az.Accounts` 2.12.1+ | Azure sign-in and tenant discovery. |
-| `Microsoft.Graph.Authentication` 2.0.0+ | Microsoft Graph sign-in and REST calls. |
+| `Microsoft.Graph.Authentication` 2.26.0+ | Microsoft Graph sign-in and REST calls. |
 
 Install the modules:
 

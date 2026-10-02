@@ -172,3 +172,39 @@ Describe 'Entry script' {
         }
     }
 }
+
+Describe 'Documentation matches the code' {
+    BeforeAll {
+        $script:ToolRoot   = Split-Path -Parent $PSScriptRoot
+        $script:ReadmeText = Get-Content -LiteralPath (Join-Path $script:ToolRoot 'README.md') -Raw
+        $script:GraphText  = Get-Content -LiteralPath (Join-Path $script:ToolRoot 'src\PimGraph.psm1') -Raw
+
+        # The prerequisite table in the README is the only place a user sees these
+        # numbers, and it drifted from the code once already.
+        $script:DeclaredModules = @(
+            [regex]::Matches($script:GraphText, "Name\s*=\s*'(?<name>[\w.]+)';\s*MinimumVersion\s*=\s*'(?<version>[\d.]+)'") |
+                ForEach-Object { [pscustomobject]@{ Name = $_.Groups['name'].Value; Version = $_.Groups['version'].Value } }
+        )
+    }
+
+    It 'finds the declared prerequisite modules' {
+        $script:DeclaredModules.Count | Should -BeGreaterThan 1
+    }
+
+    It 'states the same minimum version the code enforces' {
+        foreach ($module in $script:DeclaredModules) {
+            $pattern = '`' + [regex]::Escape($module.Name) + '`\s+(?<version>[\d.]+)\+'
+            $match = [regex]::Match($script:ReadmeText, $pattern)
+            $match.Success | Should -BeTrue -Because "the README should list $($module.Name) as a prerequisite"
+            $match.Groups['version'].Value | Should -Be $module.Version -Because "the README must match the minimum $($module.Name) version the code enforces"
+        }
+    }
+
+    It 'documents the justification minimum the code actually applies' {
+        $models = Get-Content -LiteralPath (Join-Path $script:ToolRoot 'src\PimModels.psm1') -Raw
+        $match = [regex]::Match($models, '\[int\]\s*\$MinimumLength\s*=\s*(?<length>\d+)')
+        $match.Success | Should -BeTrue
+
+        $script:ReadmeText | Should -Match ("Minimum " + $match.Groups['length'].Value + " characters")
+    }
+}
