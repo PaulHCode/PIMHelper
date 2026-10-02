@@ -983,12 +983,14 @@ function Connect-PimGraphWithDeviceCode {
 
     $secureToken = ConvertTo-SecureString -String $accessToken -AsPlainText -Force
 
+    # ContextScope is deliberately absent: Connect-MgGraph puts AccessToken in its
+    # own parameter set, which does not include it, and passing it anyway fails
+    # binding outright. A user-supplied token is process scoped regardless.
     $null = Invoke-PimExternalCommand -Name 'Connect-MgGraph' -Parameters @{
-        AccessToken  = $secureToken
-        Environment  = $CloudConfiguration.GraphEnvironment
-        ContextScope = 'Process'
-        NoWelcome    = $true
-        ErrorAction  = 'Stop'
+        AccessToken = $secureToken
+        Environment = $CloudConfiguration.GraphEnvironment
+        NoWelcome   = $true
+        ErrorAction = 'Stop'
     }
 
     $context = Get-PimGraphContext

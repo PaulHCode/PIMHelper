@@ -768,6 +768,36 @@ Describe 'Connect-PimGraphTenant' {
         @($script:RestCalls).Count | Should -Be 0 -Because 'there is nowhere to send a device code request'
     }
 
+    It 'sends only parameters Connect-MgGraph accepts alongside an access token' {
+        # AccessToken lives in its own parameter set. ContextScope looks harmless
+        # next to it but is not in that set, and passing it fails binding before a
+        # single request goes out - which unit tests with a faked Connect-MgGraph
+        # would never notice.
+        $script:ConnectCalls = @()
+        Set-PimFakeDeviceCodeFlow
+        Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) $script:ConnectCalls += , $p }
+        Set-PimCommandOverride -Name 'Get-MgContext' -Handler { param($p)
+            [pscustomobject]@{ TenantId = '11111111-1111-1111-1111-111111111111'; Environment = 'Global'; Account = 'ada@contoso.com'; Scopes = (Get-PimMinimumGraphScope) }
+        }
+
+        $null = Connect-PimGraphTenant -TenantId $script:TenantId -CloudConfiguration $script:CommercialCloud `
+            -Force -UseDeviceAuthentication -WarningAction SilentlyContinue
+
+        $real = Get-Command -Name 'Connect-MgGraph' -ErrorAction SilentlyContinue
+        if (-not $real) {
+            Set-ItResult -Skipped -Because 'Microsoft.Graph.Authentication is not installed here'
+            return
+        }
+
+        $accessTokenSet = @($real.ParameterSets | Where-Object { $_.Parameters.Name -contains 'AccessToken' })
+        $accessTokenSet.Count | Should -BeGreaterThan 0
+
+        $allowed = $accessTokenSet[0].Parameters.Name
+        foreach ($name in $script:ConnectCalls[0].Keys) {
+            $allowed | Should -Contain $name -Because "Connect-MgGraph rejects '$name' when an access token is supplied"
+        }
+    }
+
     It 'reports an actionable error when the broker leaves no context' {
         Set-PimFakeDeviceCodeFlow
         Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) }
