@@ -1716,4 +1716,83 @@ Describe 'Get-PimSafeUri' {
     }
 }
 
+Describe 'Device code sign-in against the real SDK' {
+    AfterEach {
+        Clear-PimCommandOverride
+        # A user-supplied token is process scoped, and every other test fakes
+        # Get-MgContext, but leaving a synthetic context behind would still be a
+        # trap for anyone who later writes one that does not.
+        if (Get-Command -Name 'Disconnect-MgGraph' -ErrorAction SilentlyContinue) {
+            try { $null = Disconnect-MgGraph -ErrorAction Stop } catch { }
+        }
+    }
+
+    It 'hands a token to the installed Connect-MgGraph and gets a usable context back' {
+        # Every other test in this file replaces Connect-MgGraph, so none of them
+        # can tell whether the real one would accept what the tool sends it or
+        # what it leaves behind afterwards. That gap is the entire back half of
+        # sign-in. Here the SDK is real and only the two HTTP calls are faked, so
+        # the splat, the token handoff and the context the tool then reads are all
+        # exercised as shipped. The token is unsigned and never leaves the process.
+        if (-not (Get-Command -Name 'Connect-MgGraph' -ErrorAction SilentlyContinue)) {
+            Set-ItResult -Skipped -Because 'Microsoft.Graph.Authentication is not installed here'
+            return
+        }
+
+        $tenantId = 'da667b97-c1f7-494e-b7ba-172131cd40d9'
+        $account = 'ada_contoso.com#EXT#@fabrikam.onmicrosoft.com'
+        $scopes = Get-PimMinimumGraphScope
+
+        $segment = {
+            param($Object)
+            $json = $Object | ConvertTo-Json -Compress -Depth 5
+            [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json)).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+        }
+        $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        $header = & $segment @{ typ = 'JWT'; alg = 'none' }
+        $payload = & $segment @{
+            aud   = 'https://graph.microsoft.com'
+            iss   = "https://sts.windows.net/$tenantId/"
+            tid   = $tenantId
+            upn   = $account
+            scp   = ($scopes -join ' ')
+            ver   = '1.0'
+            iat   = $now
+            nbf   = $now
+            exp   = $now + 3600
+        }
+        $script:FakeJwt = "$header.$payload."
+
+        Set-PimCommandOverride -Name 'Start-Sleep' -Handler { param($p) }
+        Set-PimCommandOverride -Name 'Invoke-RestMethod' -Handler { param($p)
+            if ($p['Uri'] -like '*/devicecode') {
+                return [pscustomobject]@{
+                    device_code      = 'device-code-value'
+                    user_code        = 'ABC123XYZ'
+                    verification_uri = 'https://microsoft.com/devicelogin'
+                    expires_in       = 900
+                    interval         = 5
+                }
+            }
+
+            return [pscustomobject]@{ access_token = $script:FakeJwt; expires_in = 3600 }
+        }
+
+        $context = Connect-PimGraphWithDeviceCode -TenantId $tenantId `
+            -CloudConfiguration (Get-PimCloudConfiguration -Name 'Commercial') `
+            -Scope $scopes -WarningAction SilentlyContinue
+
+        # Reaching here at all means the splat bound and the tool found a context.
+        $context | Should -Not -BeNullOrEmpty
+        $context.TenantId | Should -Be $tenantId
+        $context.Account  | Should -Be $account
+
+        # The tool decides whether it may read groups by reading these back off the
+        # context, so it matters that the SDK really does surface them.
+        foreach ($scope in $scopes) {
+            $context.Scopes | Should -Contain $scope
+        }
+    }
+}
+
 } # Describe 'PimGraph'
