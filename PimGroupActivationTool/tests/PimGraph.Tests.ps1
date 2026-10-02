@@ -479,8 +479,34 @@ Describe 'Connect-PimGraphTenant' {
         $script:ConnectCalls[0]['UseDeviceCode'] | Should -BeTrue
     }
 
-    It 'reports an actionable error when even a device code leaves no context' {
-        Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) }
+    It 'explains itself instead of waiting for a code nobody can read' {
+        # A worker runspace has no host, so the SDK's device code goes nowhere.
+        # Falling back there would hang the window on a code the user never sees.
+        $script:ConnectCalls = @()
+        Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) $script:ConnectCalls += , $p }
+        Set-PimCommandOverride -Name 'Get-MgContext' -Handler { param($p) $null }
+
+        $result = Connect-PimGraphTenant -TenantId $script:TenantId -CloudConfiguration $script:CommercialCloud `
+            -Force -NoDeviceCode
+
+        $result.Success | Should -BeFalse
+        $result.Detail  | Should -Match 'no way to show you one'
+        $result.Detail  | Should -Match 'UseDeviceAuthentication'
+        @($script:ConnectCalls | Where-Object { $_.ContainsKey('UseDeviceCode') }).Count |
+            Should -Be 0 -Because 'a code that cannot be displayed must never be requested'
+    }
+
+    It 'refuses an explicit device code request it cannot display' {
+        Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) throw 'Should not have tried to sign in.' }
+
+        $result = Connect-PimGraphTenant -TenantId $script:TenantId -CloudConfiguration $script:CommercialCloud `
+            -Force -NoDeviceCode -UseDeviceAuthentication
+
+        $result.Success | Should -BeFalse
+        $result.Detail  | Should -Match 'no way to show you one'
+    }
+
+    It 'reports an actionable error when even a device code leaves no context' {        Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) }
         Set-PimCommandOverride -Name 'Get-MgContext' -Handler { param($p) $null }
         Set-PimCommandOverride -Name 'Get-Module' -Handler { param($p) [pscustomobject]@{ Version = [version]'2.25.0' } }
 

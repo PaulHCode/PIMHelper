@@ -46,6 +46,15 @@ $script:RequiredModules = @(
 
 $script:CommandOverrides = @{}
 
+# The Graph SDK prints a device code through the PowerShell host. A worker runspace
+# is created without one, so the code goes nowhere the user can read it - verified by
+# running Connect-MgGraph -UseDeviceCode on a worker runspace and finding nothing on
+# the information, warning, or error streams.
+$script:DeviceCodeUnavailableMessage =
+    'A device code is needed to sign in, but this window has no way to show you one. ' +
+    'Sign in from a terminal instead, for example: ' +
+    'pwsh -File .\Start-PimGroupActivationTool.ps1 -ListGroups -TenantId <tenant> -UseDeviceAuthentication'
+
 # Cache of group display names keyed by "<tenantId>/<groupId>" so repeated loads do not
 # re-query Graph for the same group.
 $script:GroupCache = @{}
@@ -700,6 +709,11 @@ function Invoke-PimGraphSignIn {
     .PARAMETER UseDeviceAuthentication
         Use a device code from the outset and do not attempt the broker at all.
 
+    .PARAMETER NoDeviceCode
+        Never use a device code. Set by callers running on a worker runspace, which
+        has no host for the Graph SDK to print a code to, so they fail with an
+        explanation instead of waiting forever for a code nobody can read.
+
     .OUTPUTS
         An object with Context and UsedDeviceCode.
     #>
@@ -710,8 +724,15 @@ function Invoke-PimGraphSignIn {
         [hashtable] $ConnectParameters,
 
         [Parameter()]
-        [switch] $UseDeviceAuthentication
+        [switch] $UseDeviceAuthentication,
+
+        [Parameter()]
+        [switch] $NoDeviceCode
     )
+
+    if ($NoDeviceCode -and $UseDeviceAuthentication) {
+        throw $script:DeviceCodeUnavailableMessage
+    }
 
     $broker = @{}
     foreach ($key in $ConnectParameters.Keys) { $broker[$key] = $ConnectParameters[$key] }
@@ -731,6 +752,13 @@ function Invoke-PimGraphSignIn {
         throw ('Microsoft Graph reported no error but left no sign-in context, even with device code ' +
                'authentication. Make sure Microsoft.Graph.Authentication is up to date ' +
                "(installed: $(Get-PimGraphAuthenticationVersion)).")
+    }
+
+    if ($NoDeviceCode) {
+        # The Graph SDK prints the device code through the PowerShell host. A worker
+        # runspace has no host to print to, so going ahead would leave the user
+        # watching a progress bar for a code they will never be shown.
+        throw $script:DeviceCodeUnavailableMessage
     }
 
     Write-PimLog -Level Warning -Operation 'Connect-Graph' -Status 'BrokerUnavailable' `
@@ -769,6 +797,10 @@ function Connect-PimGraphTenant {
         call. When the full scope set cannot be consented, the connection is retried
         with the minimum scope set and the result reports reduced functionality.
 
+    .PARAMETER NoDeviceCode
+        Never use a device code. Set by callers running on a worker runspace, which
+        has no host for the Graph SDK to print a code to.
+
     .OUTPUTS
         pscustomobject with Success, TenantId, Environment, Account, Scopes,
         HasGroupRead, Message, and Detail. Tenant-level failures are returned rather
@@ -796,6 +828,9 @@ function Connect-PimGraphTenant {
 
         [Parameter()]
         [switch] $UseDeviceAuthentication,
+
+        [Parameter()]
+        [switch] $NoDeviceCode,
 
         [Parameter()]
         [AllowNull()]
@@ -861,7 +896,8 @@ function Connect-PimGraphTenant {
             # Once the broker has proven unusable there is no point letting a later
             # attempt fail the same way, so stay on device code for the rest of the run.
             $signIn = Invoke-PimGraphSignIn -ConnectParameters $connectParameters `
-                -UseDeviceAuthentication:($UseDeviceAuthentication -or $brokerUnusable)
+                -UseDeviceAuthentication:($UseDeviceAuthentication -or $brokerUnusable) `
+                -NoDeviceCode:$NoDeviceCode
             if ($signIn.UsedDeviceCode) { $brokerUnusable = $true }
             $context = $signIn.Context
 
