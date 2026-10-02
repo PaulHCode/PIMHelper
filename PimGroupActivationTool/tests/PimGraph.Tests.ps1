@@ -1051,6 +1051,20 @@ Describe 'Get-PimActiveGroupAssignment' {
         $active[0].AssignmentType | Should -Be 'activated'
     }
 
+    It 'stamps every record with the tenant it came from' {
+        # -ListActive merges every tenant into one table, so a record that does not
+        # carry its tenant is indistinguishable from an identical one elsewhere.
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            @{ value = @(@{ groupId = $script:GroupId; accessId = 'member'; assignmentType = 'activated'; status = 'Provisioned'; memberType = 'direct' }) }
+        }
+
+        $active = Get-PimActiveGroupAssignment -GraphBaseUri 'https://graph.microsoft.com' `
+            -TenantId $script:TenantId -TenantDisplayName 'Contoso'
+
+        $active[0].TenantId          | Should -Be $script:TenantId
+        $active[0].TenantDisplayName | Should -Be 'Contoso'
+    }
+
     It 'throws by default when the query is not permitted' {
         Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p) throw '{"error":{"code":"Authorization_RequestDenied"}}' }
         { Get-PimActiveGroupAssignment -GraphBaseUri 'https://graph.microsoft.com' } |

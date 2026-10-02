@@ -1408,6 +1408,11 @@ function Get-PimActiveGroupAssignment {
         [string] $TenantId,
 
         [Parameter()]
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $TenantDisplayName,
+
+        [Parameter()]
         [switch] $IgnoreFailure
     )
 
@@ -1430,12 +1435,16 @@ function Get-PimActiveGroupAssignment {
 
         $assignmentType = [string](Get-PimPropertyValue -InputObject $schedule -Name 'assignmentType')
         # 'activated' means it came from an eligibility; 'assigned' is a direct active assignment.
+        # Tenant identity has to travel with the record: -ListActive merges every
+        # tenant into one table, and a group ID alone does not say where it lives.
         $records.Add([pscustomobject]@{
-            GroupId        = [string](Get-PimPropertyValue -InputObject $schedule -Name 'groupId')
-            AccessId       = [string](Get-PimPropertyValue -InputObject $schedule -Name 'accessId')
-            AssignmentType = $assignmentType
-            Status         = [string](Get-PimPropertyValue -InputObject $schedule -Name 'status')
-            MemberType     = [string](Get-PimPropertyValue -InputObject $schedule -Name 'memberType')
+            TenantId          = [string]$TenantId
+            TenantDisplayName = [string]$TenantDisplayName
+            GroupId           = [string](Get-PimPropertyValue -InputObject $schedule -Name 'groupId')
+            AccessId          = [string](Get-PimPropertyValue -InputObject $schedule -Name 'accessId')
+            AssignmentType    = $assignmentType
+            Status            = [string](Get-PimPropertyValue -InputObject $schedule -Name 'status')
+            MemberType        = [string](Get-PimPropertyValue -InputObject $schedule -Name 'memberType')
         })
     }
 

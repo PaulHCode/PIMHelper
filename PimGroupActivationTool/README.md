@@ -155,6 +155,13 @@ exported to CSV passes through a redaction filter that strips JWTs, `Bearer` hea
 JSON fields named `access_token`, `refresh_token`, `id_token`, `client_secret`,
 `password`, and `code_verifier`. URIs are logged without their query strings.
 
+**Log records cannot be forged.** Group and tenant display names come from directories
+you do not administer, so every structured field is stripped of line breaks, tabs, and
+double quotes before it is written. A group named with an embedded newline plus a fake
+`[timestamp] [INFO] ...` prefix still produces exactly one record. The same reasoning
+applies to CSV exports, where a leading `=`, `+`, `-`, or `@` is neutralised so Excel
+cannot evaluate a display name as a formula.
+
 If the log file cannot be written, logging disables itself silently rather than breaking
 the run. Use `-NoLog` to turn it off deliberately.
 

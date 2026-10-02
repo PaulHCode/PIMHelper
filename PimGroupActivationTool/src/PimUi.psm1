@@ -259,7 +259,18 @@ $script:LoadGroupsWorker = {
 
     foreach ($tenant in $Tenants) {
         if ($Shared.CancelRequested) {
+            # Record every tenant we never reached, so a cancelled load cannot be
+            # mistaken for a tenant that simply had no eligible groups.
             Write-Warning 'Cancelled before all tenants were processed.'
+            foreach ($remaining in @($Tenants)[$index..($Tenants.Count - 1)]) {
+                $tenantStatus.Add([pscustomobject]@{
+                    TenantId          = $remaining.TenantId
+                    TenantDisplayName = $remaining.TenantDisplayName
+                    Success           = $false
+                    Message           = 'Skipped. The load was cancelled before this tenant was read.'
+                    GroupCount        = 0
+                })
+            }
             break
         }
 
@@ -1154,7 +1165,11 @@ function Show-PimMainForm {
             & $appendLog "$($status.TenantDisplayName): $($status.Message)" $level
         }
 
-        if ($ui.Groups.Count -eq 0) {
+        if ($payload.Cancelled) {
+            # A partial list must never read as a complete one.
+            $labelStatus.Text = "Cancelled. Showing $($ui.Groups.Count) eligible group assignment(s) from the tenants that were read. The list is incomplete."
+        }
+        elseif ($ui.Groups.Count -eq 0) {
             $labelStatus.Text = 'No eligible PIM for Groups assignments were found in the selected tenants.'
         }
         else {

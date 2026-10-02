@@ -85,8 +85,29 @@ Describe 'Write-PimLog' {
         $lines[0] | Should -BeLike '`[*`] `[INFORMATION`] op=Activate tenant=11111111-1111-1111-1111-111111111111 group=22222222-2222-2222-2222-222222222222 groupName="PIM Test Group" access=member status=Succeeded Activation submitted.'
     }
 
-    It 'omits fields that were not supplied' {
+    It 'cannot be forged by a hostile group display name' {
+        # Display names come from directories the user does not administer.
         $state = Initialize-PimLog -Path $script:LogDirectory
+        $hostile = "Helpdesk`r`n[2024-01-01 00:00:00.000Z] [INFORMATION] op=Activate status=Succeeded Granted by admin."
+        Write-PimLog -Message 'Read eligible groups.' -Operation 'Get-Groups' -GroupDisplayName $hostile
+
+        $lines = @(Get-Content -LiteralPath $state.FilePath)
+        $lines.Count | Should -Be 1
+        $lines[0] | Should -BeLike '*groupName="Helpdesk `[2024-01-01*'
+        $lines[0] | Should -BeLike '*Read eligible groups.'
+    }
+
+    It 'cannot be forged through the message or a quoted field' {
+        $state = Initialize-PimLog -Path $script:LogDirectory
+        Write-PimLog -Message "First.`r`n[2024-01-01 00:00:00.000Z] [INFORMATION] Forged." -Operation "Get`r`nGroups" -GroupDisplayName 'A" status=Succeeded'
+
+        $lines = @(Get-Content -LiteralPath $state.FilePath)
+        $lines.Count | Should -Be 1
+        # The injected quote must not be able to close groupName early.
+        $lines[0] | Should -BeLike "*groupName=`"A' status=Succeeded`"*"
+    }
+
+    It 'omits fields that were not supplied' {        $state = Initialize-PimLog -Path $script:LogDirectory
         Write-PimLog -Message 'Simple message.'
 
         $line = @(Get-Content -LiteralPath $state.FilePath)[0]

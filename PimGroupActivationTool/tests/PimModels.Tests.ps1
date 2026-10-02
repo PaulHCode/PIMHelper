@@ -233,6 +233,38 @@ Describe 'Format-PimBaseUri' {
     }
 }
 
+Describe 'ConvertTo-PimSafeLogValue' {
+    It 'passes an ordinary value through unchanged' {
+        ConvertTo-PimSafeLogValue -Value 'Contoso Admins' | Should -Be 'Contoso Admins'
+    }
+
+    It 'returns null and empty untouched' {
+        ConvertTo-PimSafeLogValue -Value $null | Should -BeNullOrEmpty
+        ConvertTo-PimSafeLogValue -Value ''   | Should -Be ''
+    }
+
+    It 'collapses <Description> so one value cannot forge a second record' -ForEach @(
+        @{ Description = 'CRLF';            Value = "a`r`nb";  Expected = 'a b' }
+        @{ Description = 'a bare linefeed'; Value = "a`nb";    Expected = 'a b' }
+        @{ Description = 'a tab';           Value = "a`tb";    Expected = 'a b' }
+        @{ Description = 'a run of breaks'; Value = "a`r`n`r`nb"; Expected = 'a b' }
+    ) {
+        ConvertTo-PimSafeLogValue -Value $Value | Should -Be $Expected
+    }
+
+    It 'rewrites double quotes so a quoted field cannot be closed early' {
+        ConvertTo-PimSafeLogValue -Value 'Admins" status=Success' | Should -Be "Admins' status=Success"
+    }
+
+    It 'defuses a forged log record in a group display name' {
+        $hostile = "Helpdesk`r`n[2024-01-01 00:00:00.000Z] [INFO] op=Activate status=Success"
+        $safe = ConvertTo-PimSafeLogValue -Value $hostile
+        $safe | Should -Not -Match "`r"
+        $safe | Should -Not -Match "`n"
+        @($safe -split "`r`n|`n").Count | Should -Be 1
+    }
+}
+
 Describe 'ConvertTo-PimSafeCsvValue' {
     It 'passes an ordinary value through unchanged' {
         ConvertTo-PimSafeCsvValue -Value 'Contoso Admins' | Should -Be 'Contoso Admins'
@@ -697,8 +729,15 @@ Describe 'Test-PimJustification' {
         @{ Description = 'empty';      Value = '' }
         @{ Description = 'whitespace'; Value = "  `t " }
         @{ Description = 'too short';  Value = 'ab' }
+        @{ Description = 'shorter than the documented 10-character minimum'; Value = 'needed' }
     ) {
         Test-PimJustification -Justification $Value | Should -BeFalse
+    }
+
+    It 'uses the same minimum the error messages promise' {
+        # The headless error text says "at least 10 characters"; the default must agree.
+        Test-PimJustification -Justification ('x' * 9)  | Should -BeFalse
+        Test-PimJustification -Justification ('x' * 10) | Should -BeTrue
     }
 
     It 'accepts a real justification' {
@@ -726,7 +765,7 @@ Describe 'Get-PimSubmissionReadiness' {
     It 'blocks submission with no justification' {
         $readiness = Get-PimSubmissionReadiness -SelectedGroupCount 1 -Justification '' -Duration ([timespan]::FromHours(2))
         $readiness.CanSubmit | Should -BeFalse
-        $readiness.Reasons   | Should -Contain 'Enter a justification.'
+        $readiness.Reasons   | Should -Contain 'Enter a justification of at least 10 characters.'
     }
 
     It 'blocks submission with no duration' {
@@ -875,7 +914,7 @@ Describe 'Get-PimUiControlState' {
     It 'explains why submit is blocked' {
         $s = Get-PimUiControlState -State 'GroupsReady' -SelectedGroupCount 0 -Justification '' -Duration $null
         $s.SubmitBlockedReasons | Should -Contain 'Select at least one group.'
-        $s.SubmitBlockedReasons | Should -Contain 'Enter a justification.'
+        $s.SubmitBlockedReasons | Should -Contain 'Enter a justification of at least 10 characters.'
         $s.SubmitBlockedReasons | Should -Contain 'Choose a duration.'
     }
 

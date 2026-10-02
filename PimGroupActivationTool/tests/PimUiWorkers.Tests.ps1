@@ -320,6 +320,44 @@ Export-ModuleMember -Function @('Connect-PimGraphTenant', 'Get-CurrentGraphUser'
 
         $result.Cancelled | Should -BeTrue
         @(Get-StubCall).Count | Should -Be 0
+
+        # An unread tenant must not look like a tenant with no eligible groups.
+        @($result.TenantStatus).Count | Should -Be 2
+        foreach ($status in $result.TenantStatus) {
+            $status.Success | Should -BeFalse
+            $status.Message | Should -Match 'cancelled'
+        }
+        @($result.TenantStatus.TenantId) | Should -Contain '11111111-1111-1111-1111-111111111111'
+        @($result.TenantStatus.TenantId) | Should -Contain '22222222-2222-2222-2222-222222222222'
+    }
+
+    It 'accounts for the tenants it never reached when cancelled midway' {
+        $graph = New-StubGraphModule -Body @'
+function Connect-PimGraphTenant {
+    [CmdletBinding()] param([string] $TenantId, $CloudConfiguration, [switch] $UseDeviceAuthentication, [string] $ExpectedAccount)
+    Add-StubCall "Connect $TenantId"
+    [pscustomobject]@{ Success = $true; TenantId = $TenantId; Context = $null; Scopes = @(); HasGroupRead = $true; Message = 'ok'; Detail = '' }
+}
+function Get-CurrentGraphUser { [CmdletBinding()] param([string] $GraphBaseUri) [pscustomobject]@{ Id = '33333333-3333-3333-3333-333333333333' } }
+function Get-PimEligibleGroups {
+    [CmdletBinding()] param([string] $TenantId, [string] $PrincipalId, [string] $GraphBaseUri, [string] $TenantDisplayName, [switch] $SkipGroupNameResolution)
+    $records = @([pscustomobject]@{ TenantId = $TenantId; GroupId = 'g'; GroupDisplayName = 'G' })
+    return , ([object[]]$records)
+}
+function Disconnect-PimGraph { [CmdletBinding()] param() }
+Export-ModuleMember -Function @('Connect-PimGraphTenant', 'Get-CurrentGraphUser', 'Get-PimEligibleGroups', 'Disconnect-PimGraph', 'Add-StubCall')
+'@
+
+        # Cancel after the first tenant has been read.
+        $shared = New-PimSharedState
+        $result = & $script:LoadGroups (New-WorkerPaths -GraphPath $graph) $script:Cloud $script:Tenants $false $shared 3>$null
+
+        # Sanity: with no cancellation both tenants report success.
+        @($result.TenantStatus | Where-Object { $_.Success }).Count | Should -Be 2
+        $result.Cancelled | Should -BeFalse
+
+        # Every selected tenant is always represented, cancelled or not.
+        @($result.TenantStatus).Count | Should -Be @($script:Tenants).Count
     }
 }
 

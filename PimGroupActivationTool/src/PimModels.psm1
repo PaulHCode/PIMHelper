@@ -877,6 +877,41 @@ function Remove-PimSensitiveData {
     }
 }
 
+function ConvertTo-PimSafeLogValue {
+    <#
+    .SYNOPSIS
+        Neutralizes log forging in a value bound for a structured log field.
+
+    .DESCRIPTION
+        Group and tenant display names come from directories the user does not
+        administer, so a display name can contain a CRLF followed by a crafted
+        "[timestamp] [INFO] op=..." prefix and inject fabricated entries into the
+        audit log this tool writes to disk and mirrors into the UI.
+
+        Line breaks and tabs collapse to a single space so one value can never
+        become more than one record, and double quotes become single quotes so a
+        quoted field cannot be closed early.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(ValueFromPipeline)]
+        [AllowNull()]
+        [AllowEmptyString()]
+        [object] $Value
+    )
+
+    process {
+        if ($null -eq $Value) { return $null }
+
+        $text = [string]$Value
+        if ($text.Length -eq 0) { return $text }
+
+        $text = [regex]::Replace($text, '[\r\n\t]+', ' ')
+        return $text.Replace('"', "'")
+    }
+}
+
 function ConvertTo-PimSafeCsvValue {
     <#
     .SYNOPSIS
@@ -1114,7 +1149,7 @@ function Test-PimJustification {
         [string] $Justification,
 
         [Parameter()]
-        [int] $MinimumLength = 3
+        [int] $MinimumLength = 10
     )
 
     if ([string]::IsNullOrWhiteSpace($Justification)) { return $false }
@@ -1149,7 +1184,7 @@ function Get-PimSubmissionReadiness {
 
     if ($IsBusy) { $reasons.Add('An operation is already running.') }
     if ($SelectedGroupCount -le 0) { $reasons.Add('Select at least one group.') }
-    if (-not (Test-PimJustification -Justification $Justification)) { $reasons.Add('Enter a justification.') }
+    if (-not (Test-PimJustification -Justification $Justification)) { $reasons.Add('Enter a justification of at least 10 characters.') }
     if ($null -eq $Duration -or $Duration.Ticks -le 0) { $reasons.Add('Choose a duration.') }
 
     [pscustomobject]@{
@@ -1343,6 +1378,7 @@ Export-ModuleMember -Function @(
     'Assert-PimGuid'
     'Remove-PimSensitiveData'
     'ConvertTo-PimSafeCsvValue'
+    'ConvertTo-PimSafeLogValue'
     'Format-PimGraphError'
     'ConvertTo-PimErrorText'
     'ConvertTo-PimExceptionText'

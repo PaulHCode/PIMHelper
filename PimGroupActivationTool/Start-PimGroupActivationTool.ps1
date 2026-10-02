@@ -389,7 +389,7 @@ if ($ListActive) {
         Write-Host "Querying $($tenant.TenantDisplayName) ($($tenant.TenantId))..." -ForegroundColor Cyan
         try {
             $null = Connect-PimHeadlessTenant -Tenant $tenant.TenantId
-            $active = Get-PimActiveGroupAssignment -GraphBaseUri $cloudConfiguration.GraphBaseUri -TenantId $tenant.TenantId
+            $active = Get-PimActiveGroupAssignment -GraphBaseUri $cloudConfiguration.GraphBaseUri -TenantId $tenant.TenantId -TenantDisplayName $tenant.TenantDisplayName
             foreach ($item in $active) { $allActive.Add($item) }
             Write-Host "  $($active.Count) active assignment(s)." -ForegroundColor Green
         }
@@ -398,7 +398,8 @@ if ($ListActive) {
         }
     }
 
-    $allActive | Format-Table -AutoSize | Out-Host
+    $allActive | Select-Object TenantDisplayName, GroupId, AccessId, AssignmentType, Status, MemberType, TenantId |
+        Format-Table -AutoSize | Out-Host
     $allActive
     exit 0
 }

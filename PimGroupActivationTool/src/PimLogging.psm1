@@ -179,17 +179,19 @@ function Write-PimLog {
         [string] $Status
     )
 
-    $safeMessage = Remove-PimSensitiveData -Text $Message
+    # Message is redacted; every other field is attacker-influenced text from a
+    # foreign directory, so it must not be able to forge a new log record.
+    $safeMessage = ConvertTo-PimSafeLogValue -Value (Remove-PimSensitiveData -Text $Message)
 
     $fields = New-Object System.Collections.Generic.List[string]
     $fields.Add(('[{0:yyyy-MM-dd HH:mm:ss.fffZ}]' -f [datetime]::UtcNow))
     $fields.Add(('[{0}]' -f $Level.ToUpperInvariant()))
-    if (-not [string]::IsNullOrWhiteSpace($Operation))        { $fields.Add("op=$Operation") }
-    if (-not [string]::IsNullOrWhiteSpace($TenantId))         { $fields.Add("tenant=$TenantId") }
-    if (-not [string]::IsNullOrWhiteSpace($GroupId))          { $fields.Add("group=$GroupId") }
-    if (-not [string]::IsNullOrWhiteSpace($GroupDisplayName)) { $fields.Add("groupName=""$GroupDisplayName""") }
-    if (-not [string]::IsNullOrWhiteSpace($AccessId))         { $fields.Add("access=$AccessId") }
-    if (-not [string]::IsNullOrWhiteSpace($Status))           { $fields.Add("status=$Status") }
+    if (-not [string]::IsNullOrWhiteSpace($Operation))        { $fields.Add("op=$(ConvertTo-PimSafeLogValue -Value $Operation)") }
+    if (-not [string]::IsNullOrWhiteSpace($TenantId))         { $fields.Add("tenant=$(ConvertTo-PimSafeLogValue -Value $TenantId)") }
+    if (-not [string]::IsNullOrWhiteSpace($GroupId))          { $fields.Add("group=$(ConvertTo-PimSafeLogValue -Value $GroupId)") }
+    if (-not [string]::IsNullOrWhiteSpace($GroupDisplayName)) { $fields.Add("groupName=""$(ConvertTo-PimSafeLogValue -Value $GroupDisplayName)""") }
+    if (-not [string]::IsNullOrWhiteSpace($AccessId))         { $fields.Add("access=$(ConvertTo-PimSafeLogValue -Value $AccessId)") }
+    if (-not [string]::IsNullOrWhiteSpace($Status))           { $fields.Add("status=$(ConvertTo-PimSafeLogValue -Value $Status)") }
     $fields.Add($safeMessage)
 
     $line = ($fields -join ' ')
