@@ -39,7 +39,9 @@ $script:MinimumGraphScopes = @(
 
 $script:RequiredModules = @(
     [pscustomobject]@{ Name = 'Az.Accounts';                    MinimumVersion = '2.12.1'; InstallName = 'Az.Accounts';    Purpose = 'Azure sign-in and tenant discovery' }
-    [pscustomobject]@{ Name = 'Microsoft.Graph.Authentication'; MinimumVersion = '2.0.0';  InstallName = 'Microsoft.Graph.Authentication'; Purpose = 'Microsoft Graph sign-in and REST calls' }
+    # 2.25.0 and earlier can return from Connect-MgGraph without an error and
+    # without a context when the Web Account Manager broker cannot prompt.
+    [pscustomobject]@{ Name = 'Microsoft.Graph.Authentication'; MinimumVersion = '2.26.0'; InstallName = 'Microsoft.Graph.Authentication'; Purpose = 'Microsoft Graph sign-in and REST calls' }
 )
 
 $script:CommandOverrides = @{}
@@ -448,6 +450,32 @@ function Get-PimGraphContext {
     }
 }
 
+function Get-PimGraphAuthenticationVersion {
+    <#
+    .SYNOPSIS
+        Returns the loaded Microsoft.Graph.Authentication version, or 'unknown'.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+
+    try {
+        $module = Invoke-PimExternalCommand -Name 'Get-Module' -Parameters @{
+            Name        = 'Microsoft.Graph.Authentication'
+            ErrorAction = 'SilentlyContinue'
+        }
+        if ($module) {
+            $version = Get-PimPropertyValue -InputObject @($module)[0] -Name 'Version'
+            if ($version) { return [string]$version }
+        }
+    }
+    catch {
+        # Reporting the version is best effort; never let it mask the real error.
+    }
+
+    return 'unknown'
+}
+
 function Test-PimGraphContext {
     <#
     .SYNOPSIS
@@ -593,6 +621,17 @@ function Connect-PimGraphTenant {
             $null = Invoke-PimExternalCommand -Name 'Connect-MgGraph' -Parameters $connectParameters
 
             $context = Get-PimGraphContext
+            if ($null -eq $context) {
+                # Connect-MgGraph can return without raising an error and still
+                # leave no context. On Windows this is almost always the Web
+                # Account Manager broker failing when it has no usable parent
+                # window, which older module versions swallow silently.
+                throw ('Microsoft Graph reported no error but left no sign-in context. ' +
+                       'This usually means the Web Account Manager broker could not display a sign-in prompt. ' +
+                       'Retry with device code authentication, and make sure Microsoft.Graph.Authentication is up to date ' +
+                       "(installed: $(Get-PimGraphAuthenticationVersion)).")
+            }
+
             if (-not (Test-PimGraphContext -Context $context -TenantId $TenantId -GraphEnvironment $graphEnvironment)) {
                 $actualTenant = Get-PimPropertyValue -InputObject $context -Name 'TenantId'
                 $actualEnvironment = Get-PimPropertyValue -InputObject $context -Name 'Environment'
@@ -1418,6 +1457,7 @@ Export-ModuleMember -Function @(
     'Disconnect-PimAzureAccount'
     'Get-PimAuthorizedTenant'
     'Get-PimGraphContext'
+    'Get-PimGraphAuthenticationVersion'
     'Test-PimGraphContext'
     'Connect-PimGraphTenant'
     'Compare-PimScopeSet'

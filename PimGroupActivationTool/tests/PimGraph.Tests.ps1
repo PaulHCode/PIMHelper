@@ -334,6 +334,21 @@ Describe 'Test-PimGraphContext' {
 }
 
 Describe 'Connect-PimGraphTenant' {
+    It 'reports an actionable error when Connect-MgGraph leaves no context' {
+        # Observed live: the WAM broker can fail to prompt and Connect-MgGraph
+        # returns without raising anything, leaving Get-MgContext null.
+        Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) }
+        Set-PimCommandOverride -Name 'Get-MgContext' -Handler { param($p) $null }
+        Set-PimCommandOverride -Name 'Get-Module' -Handler { param($p) [pscustomobject]@{ Version = [version]'2.25.0' } }
+
+        $result = Connect-PimGraphTenant -TenantId $script:TenantId -CloudConfiguration $script:CommercialCloud -Force
+
+        $result.Success | Should -BeFalse
+        $result.Detail  | Should -Match 'Web Account Manager'
+        $result.Detail  | Should -Match 'device code'
+        $result.Detail  | Should -Match '2\.25\.0'
+    }
+
     It 'connects with the full scope set and the correct environment' {
         Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) $script:ConnectParameters = $p }
         Set-PimCommandOverride -Name 'Get-MgContext' -Handler { param($p)
