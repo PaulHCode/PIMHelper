@@ -790,14 +790,22 @@ Describe 'Test-PimAccountMatch' {
             Should -BeFalse
     }
 
-    It 'cannot accuse when <side> is unknown' -ForEach @(
-        @{ Side = 'the expected account'; Expected = '';                Actual = 'ada@contoso.com' }
-        @{ Side = 'the actual account';   Expected = 'ada@contoso.com'; Actual = '' }
-        @{ Side = 'both accounts';        Expected = '';                Actual = '' }
+    It 'cannot be satisfied by an unknown account when one is expected' -ForEach @(
+        @{ Case = 'null';       Actual = $null }
+        @{ Case = 'empty';      Actual = '' }
+        @{ Case = 'whitespace'; Actual = '   ' }
     ) {
-        # A Graph context built from a caller-supplied token carries no account.
-        # Reporting a mismatch there would be a false accusation.
-        Test-PimAccountMatch -Expected $Expected -Actual $Actual | Should -BeTrue
+        # A Graph context built from a caller-supplied token has a blank account
+        # and could belong to anyone, so it must not pass as the expected person.
+        Test-PimAccountMatch -Expected 'ada@contoso.com' -Actual $Actual | Should -BeFalse
+    }
+
+    It 'has nothing to enforce when no account is expected' -ForEach @(
+        @{ Case = 'null';       Expected = $null }
+        @{ Case = 'empty';      Expected = '' }
+        @{ Case = 'whitespace'; Expected = '   ' }
+    ) {
+        Test-PimAccountMatch -Expected $Expected -Actual 'ada@contoso.com' | Should -BeTrue
     }
 }
 

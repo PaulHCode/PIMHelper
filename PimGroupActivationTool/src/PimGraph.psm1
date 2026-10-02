@@ -480,7 +480,14 @@ function Test-PimGraphContext {
     <#
     .SYNOPSIS
         Returns $true when the current Graph context targets the expected tenant,
-        environment, account, and scopes.
+        environment, and scopes.
+
+    .DESCRIPTION
+        Deliberately says nothing about which account the context belongs to.
+        Establishing that can require a Graph call when the context carries no
+        account, so the identity gate lives in Connect-PimGraphTenant, where
+        Resolve-PimContextAccount and Test-PimAccountMatch are applied both to a
+        reused session and to a freshly connected one.
     #>
     [CmdletBinding()]
     [OutputType([bool])]
@@ -497,11 +504,7 @@ function Test-PimGraphContext {
 
         [Parameter()]
         [AllowNull()]
-        [string[]] $RequiredScopes,
-
-        [Parameter()]
-        [AllowNull()]
-        [string] $ExpectedAccount
+        [string[]] $RequiredScopes
     )
 
     if ($null -eq $Context) { return $false }
@@ -516,17 +519,6 @@ function Test-PimGraphContext {
         return $false
     }
 
-    # A stale context can belong to a different signed-in user after an account
-    # switch, which would silently enumerate somebody else's eligible groups.
-    # The two names are compared by home identity because Azure reports the home
-    # UPN while Graph reports the B2B external UPN in a tenant the user guests in.
-    if (-not [string]::IsNullOrWhiteSpace($ExpectedAccount)) {
-        $contextAccount = Get-PimPropertyValue -InputObject $Context -Name 'Account'
-        if (-not (Test-PimAccountMatch -Expected $ExpectedAccount -Actual ([string]$contextAccount))) {
-            return $false
-        }
-    }
-
     if ($RequiredScopes) {
         $granted = @(Get-PimPropertyValue -InputObject $Context -Name 'Scopes')
         foreach ($scope in $RequiredScopes) {
@@ -535,6 +527,71 @@ function Test-PimGraphContext {
     }
 
     return $true
+}
+
+function Resolve-PimContextAccount {
+    <#
+    .SYNOPSIS
+        Returns the account a Microsoft Graph context is actually signed in as.
+
+    .DESCRIPTION
+        Get-MgContext usually reports the account, but a context built from a
+        caller-supplied access token populates Scopes and leaves Account empty.
+        Trusting that blank value would let any token pass an identity check, so
+        the real principal is read from Graph instead.
+
+        Returns an empty string when the principal cannot be established, which
+        callers must treat as a failed check rather than a pass.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter()]
+        [AllowNull()]
+        [object] $Context,
+
+        [Parameter(Mandatory)]
+        [string] $GraphBaseUri
+    )
+
+    if ($null -eq $Context) { return '' }
+
+    $account = [string](Get-PimPropertyValue -InputObject $Context -Name 'Account')
+    if (-not [string]::IsNullOrWhiteSpace($account)) { return $account }
+
+    try {
+        $me = Get-CurrentGraphUser -GraphBaseUri $GraphBaseUri
+        return [string]$me.UserPrincipalName
+    }
+    catch {
+        Write-PimLog -Level Warning -Operation 'Connect-Graph' -Status 'Failed' `
+            -Message "Could not establish which account the Microsoft Graph session belongs to: $(ConvertTo-PimErrorText -ErrorObject $_)"
+        return ''
+    }
+}
+
+function Test-PimConnectSupportsLoginHint {
+    <#
+    .SYNOPSIS
+        Returns $true when the installed Connect-MgGraph accepts -LoginHint.
+
+    .DESCRIPTION
+        -LoginHint tells the broker which account to sign in, which is what stops
+        it from silently reusing a cached one. It is not present in every
+        supported version of the module, and the command is replaced wholesale in
+        tests, so its availability is discovered rather than assumed.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param()
+
+    try {
+        $command = Get-Command -Name 'Connect-MgGraph' -ErrorAction Stop
+        return [bool]$command.Parameters.ContainsKey('LoginHint')
+    }
+    catch {
+        return $false
+    }
 }
 
 function Connect-PimGraphTenant {
@@ -588,10 +645,18 @@ function Connect-PimGraphTenant {
 
     if (-not $Force) {
         $existing = Get-PimGraphContext
-        if (Test-PimGraphContext -Context $existing -TenantId $TenantId -GraphEnvironment $graphEnvironment -RequiredScopes $FallbackScopes -ExpectedAccount $ExpectedAccount) {
-            $grantedScopes = @(Get-PimPropertyValue -InputObject $existing -Name 'Scopes')
-            Write-PimLog -Operation 'Connect-Graph' -TenantId $TenantId -Status 'Reused' -Message 'Reusing the existing Microsoft Graph context.'
-            return (New-PimGraphConnectionResult -Success $true -TenantId $TenantId -Context $existing -Scopes $grantedScopes -Message 'Reused the existing Microsoft Graph session.')
+        if (Test-PimGraphContext -Context $existing -TenantId $TenantId -GraphEnvironment $graphEnvironment -RequiredScopes $FallbackScopes) {
+            # The account is checked separately because establishing it may need a
+            # Graph call, which Test-PimGraphContext deliberately cannot make.
+            $existingAccount = Resolve-PimContextAccount -Context $existing -GraphBaseUri $CloudConfiguration.GraphBaseUri
+            if (Test-PimAccountMatch -Expected $ExpectedAccount -Actual $existingAccount) {
+                $grantedScopes = @(Get-PimPropertyValue -InputObject $existing -Name 'Scopes')
+                Write-PimLog -Operation 'Connect-Graph' -TenantId $TenantId -Status 'Reused' -Message 'Reusing the existing Microsoft Graph context.'
+                return (New-PimGraphConnectionResult -Success $true -TenantId $TenantId -Context $existing -Scopes $grantedScopes -Message 'Reused the existing Microsoft Graph session.')
+            }
+
+            Write-PimLog -Level Warning -Operation 'Connect-Graph' -TenantId $TenantId -Status 'Rejected' `
+                -Message 'The existing Microsoft Graph session belongs to a different account. Signing in again.'
         }
     }
 
@@ -620,6 +685,12 @@ function Connect-PimGraphTenant {
             }
             if ($UseDeviceAuthentication) { $connectParameters['UseDeviceCode'] = $true }
 
+            # Ask for the account we already signed in to Azure with, so the broker
+            # does not quietly satisfy this from a different cached account.
+            if (-not [string]::IsNullOrWhiteSpace($ExpectedAccount) -and (Test-PimConnectSupportsLoginHint)) {
+                $connectParameters['LoginHint'] = $ExpectedAccount
+            }
+
             $null = Invoke-PimExternalCommand -Name 'Connect-MgGraph' -Parameters $connectParameters
 
             $context = Get-PimGraphContext
@@ -638,6 +709,19 @@ function Connect-PimGraphTenant {
                 $actualTenant = Get-PimPropertyValue -InputObject $context -Name 'TenantId'
                 $actualEnvironment = Get-PimPropertyValue -InputObject $context -Name 'Environment'
                 throw "Microsoft Graph connected to tenant '$actualTenant' in environment '$actualEnvironment' instead of tenant '$TenantId' in environment '$graphEnvironment'."
+            }
+
+            # Signing in again is not proof of who we signed in as. The broker can
+            # satisfy the request from a cached account without prompting, so the
+            # identity has to be confirmed after connecting, not just before.
+            if (-not [string]::IsNullOrWhiteSpace($ExpectedAccount)) {
+                $actualAccount = Resolve-PimContextAccount -Context $context -GraphBaseUri $CloudConfiguration.GraphBaseUri
+                if (-not (Test-PimAccountMatch -Expected $ExpectedAccount -Actual $actualAccount)) {
+                    $reported = $actualAccount
+                    if ([string]::IsNullOrWhiteSpace($reported)) { $reported = 'an account that could not be identified' }
+                    throw ("Microsoft Graph signed in as $reported but Azure is signed in as $ExpectedAccount. " +
+                           'Sign out of the other account, or start the tool again and choose the matching account.')
+                }
             }
 
             $grantedScopes = @(Get-PimPropertyValue -InputObject $context -Name 'Scopes')
@@ -1470,6 +1554,8 @@ Export-ModuleMember -Function @(
     'Get-PimGraphContext'
     'Get-PimGraphAuthenticationVersion'
     'Test-PimGraphContext'
+    'Resolve-PimContextAccount'
+    'Test-PimConnectSupportsLoginHint'
     'Connect-PimGraphTenant'
     'Compare-PimScopeSet'
     'New-PimGraphConnectionResult'

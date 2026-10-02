@@ -318,55 +318,50 @@ Describe 'Test-PimGraphContext' {
         Test-PimGraphContext -Context $context -TenantId 'aaaaaaaa-1111-1111-1111-111111111111' -GraphEnvironment 'global' | Should -BeTrue
     }
 
-    It 'rejects a context belonging to a different signed-in account' {
-        Test-PimGraphContext -Context $script:GoodContext -TenantId $script:TenantId -GraphEnvironment 'Global' -ExpectedAccount 'bob@contoso.com' | Should -BeFalse
-    }
-
-    It 'accepts a context whose account matches, ignoring case' {
-        Test-PimGraphContext -Context $script:GoodContext -TenantId $script:TenantId -GraphEnvironment 'Global' -ExpectedAccount 'ADA@contoso.com' | Should -BeTrue
-    }
-
-    It 'ignores the account check when no account is expected' {
-        foreach ($expected in @($null, '', '   ')) {
-            Test-PimGraphContext -Context $script:GoodContext -TenantId $script:TenantId -GraphEnvironment 'Global' -ExpectedAccount $expected | Should -BeTrue
-        }
-    }
-
-    It 'accepts the signed-in account against its B2B spelling in a guest tenant' {
-        # Azure reports the home UPN and Graph reports the external UPN, so a
-        # literal comparison would reject every cross-tenant session the tool makes.
-        $guest = [pscustomobject]@{
+    It 'says nothing about which account the context belongs to' -ForEach @(
+        @{ Case = 'a different account'; Account = 'bob@contoso.com' }
+        @{ Case = 'no account at all';   Account = '' }
+    ) {
+        # The account gate deliberately lives in Connect-PimGraphTenant, which can
+        # call Graph to establish the principal when the context does not name one.
+        $context = [pscustomobject]@{
             TenantId    = $script:TenantId
             Environment = 'Global'
-            Account     = 'ada_contoso.com#EXT#@fabrikam.onmicrosoft.com'
+            Account     = $Account
             Scopes      = @()
         }
-        Test-PimGraphContext -Context $guest -TenantId $script:TenantId -GraphEnvironment 'Global' -ExpectedAccount 'ada@contoso.com' |
-            Should -BeTrue
+        Test-PimGraphContext -Context $context -TenantId $script:TenantId -GraphEnvironment 'Global' | Should -BeTrue
+    }
+}
+
+Describe 'Resolve-PimContextAccount' {
+    AfterEach { Clear-PimCommandOverride }
+
+    It 'uses the account the context already reports' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p) throw 'Graph should not be called.' }
+        $context = [pscustomobject]@{ Account = 'ada@contoso.com' }
+        Resolve-PimContextAccount -Context $context -GraphBaseUri 'https://graph.microsoft.com' |
+            Should -Be 'ada@contoso.com'
     }
 
-    It 'still rejects a different guest from another home tenant' {
-        $other = [pscustomobject]@{
-            TenantId    = $script:TenantId
-            Environment = 'Global'
-            Account     = 'ada_northwind.com#EXT#@fabrikam.onmicrosoft.com'
-            Scopes      = @()
+    It 'asks Graph who it is when the context has no account' {
+        # Connect-MgGraph -AccessToken populates Scopes but leaves Account blank.
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            @{ id = '22222222-2222-2222-2222-222222222222'; userPrincipalName = 'ada_contoso.com#EXT#@fabrikam.onmicrosoft.com'; displayName = 'Ada' }
         }
-        Test-PimGraphContext -Context $other -TenantId $script:TenantId -GraphEnvironment 'Global' -ExpectedAccount 'ada@contoso.com' |
-            Should -BeFalse
+        $context = [pscustomobject]@{ Account = '' }
+        Resolve-PimContextAccount -Context $context -GraphBaseUri 'https://graph.microsoft.com' |
+            Should -Be 'ada_contoso.com#EXT#@fabrikam.onmicrosoft.com'
     }
 
-    It 'accepts a context that carries no account at all' {
-        # Connect-MgGraph -AccessToken produces exactly this: the scopes come from
-        # the token but Account is blank, so there is nothing to compare.
-        $tokenContext = [pscustomobject]@{
-            TenantId    = $script:TenantId
-            Environment = 'Global'
-            Account     = ''
-            Scopes      = @()
-        }
-        Test-PimGraphContext -Context $tokenContext -TenantId $script:TenantId -GraphEnvironment 'Global' -ExpectedAccount 'ada@contoso.com' |
-            Should -BeTrue
+    It 'returns nothing when the principal cannot be established' {
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p) throw 'Forbidden' }
+        $context = [pscustomobject]@{ Account = '' }
+        Resolve-PimContextAccount -Context $context -GraphBaseUri 'https://graph.microsoft.com' | Should -Be ''
+    }
+
+    It 'returns nothing for a null context' {
+        Resolve-PimContextAccount -Context $null -GraphBaseUri 'https://graph.microsoft.com' | Should -Be ''
     }
 }
 
@@ -384,6 +379,94 @@ Describe 'Connect-PimGraphTenant' {
         $result.Detail  | Should -Match 'Web Account Manager'
         $result.Detail  | Should -Match 'device code'
         $result.Detail  | Should -Match '2\.25\.0'
+    }
+
+    It 'refuses the session when the broker signs in as somebody else' {
+        # Connecting again is not proof of who we connected as: the broker can
+        # satisfy the request from a cached account without ever prompting.
+        Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) }
+        Set-PimCommandOverride -Name 'Get-MgContext' -Handler { param($p)
+            [pscustomobject]@{ TenantId = '11111111-1111-1111-1111-111111111111'; Environment = 'Global'; Account = 'mallory@contoso.com'; Scopes = (Get-PimMinimumGraphScope) }
+        }
+
+        $result = Connect-PimGraphTenant -TenantId $script:TenantId -CloudConfiguration $script:CommercialCloud `
+            -Force -ExpectedAccount 'ada@contoso.com'
+
+        $result.Success | Should -BeFalse
+        $result.Detail  | Should -Match 'mallory@contoso.com'
+        $result.Detail  | Should -Match 'ada@contoso.com'
+    }
+
+    It 'accepts the session when the broker signs in as the guest form of the same person' {
+        Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) }
+        Set-PimCommandOverride -Name 'Get-MgContext' -Handler { param($p)
+            [pscustomobject]@{ TenantId = '11111111-1111-1111-1111-111111111111'; Environment = 'Global'; Account = 'ada_contoso.com#EXT#@fabrikam.onmicrosoft.com'; Scopes = (Get-PimMinimumGraphScope) }
+        }
+
+        $result = Connect-PimGraphTenant -TenantId $script:TenantId -CloudConfiguration $script:CommercialCloud `
+            -Force -ExpectedAccount 'ada@contoso.com'
+
+        $result.Success | Should -BeTrue
+    }
+
+    It 'refuses a token-based session whose principal cannot be established' {
+        # Account is blank and /me fails, so there is no evidence of who this is.
+        Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) }
+        Set-PimCommandOverride -Name 'Get-MgContext' -Handler { param($p)
+            [pscustomobject]@{ TenantId = '11111111-1111-1111-1111-111111111111'; Environment = 'Global'; Account = ''; Scopes = (Get-PimMinimumGraphScope) }
+        }
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p) throw 'Forbidden' }
+
+        $result = Connect-PimGraphTenant -TenantId $script:TenantId -CloudConfiguration $script:CommercialCloud `
+            -Force -ExpectedAccount 'ada@contoso.com'
+
+        $result.Success | Should -BeFalse
+        $result.Detail  | Should -Match 'could not be identified'
+    }
+
+    It 'accepts a token-based session once Graph confirms the principal' {
+        Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) }
+        Set-PimCommandOverride -Name 'Get-MgContext' -Handler { param($p)
+            [pscustomobject]@{ TenantId = '11111111-1111-1111-1111-111111111111'; Environment = 'Global'; Account = ''; Scopes = (Get-PimMinimumGraphScope) }
+        }
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            @{ id = '22222222-2222-2222-2222-222222222222'; userPrincipalName = 'ada_contoso.com#EXT#@fabrikam.onmicrosoft.com'; displayName = 'Ada' }
+        }
+
+        $result = Connect-PimGraphTenant -TenantId $script:TenantId -CloudConfiguration $script:CommercialCloud `
+            -Force -ExpectedAccount 'ada@contoso.com'
+
+        $result.Success | Should -BeTrue
+    }
+
+    It 'does not reuse a session that belongs to a different account' {
+        Set-PimCommandOverride -Name 'Get-MgContext' -Handler { param($p)
+            [pscustomobject]@{ TenantId = '11111111-1111-1111-1111-111111111111'; Environment = 'Global'; Account = 'mallory@contoso.com'; Scopes = (Get-PimMinimumGraphScope) }
+        }
+        $script:Connected = $false
+        Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) $script:Connected = $true }
+
+        $null = Connect-PimGraphTenant -TenantId $script:TenantId -CloudConfiguration $script:CommercialCloud `
+            -ExpectedAccount 'ada@contoso.com'
+
+        $script:Connected | Should -BeTrue -Because 'the mismatched session must not be reused'
+    }
+
+    It 'asks the broker for the account Azure is already signed in as' {
+        Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) $script:ConnectParameters = $p }
+        Set-PimCommandOverride -Name 'Get-MgContext' -Handler { param($p)
+            [pscustomobject]@{ TenantId = '11111111-1111-1111-1111-111111111111'; Environment = 'Global'; Account = 'ada@contoso.com'; Scopes = (Get-PimMinimumGraphScope) }
+        }
+
+        $null = Connect-PimGraphTenant -TenantId $script:TenantId -CloudConfiguration $script:CommercialCloud `
+            -Force -ExpectedAccount 'ada@contoso.com'
+
+        if (Test-PimConnectSupportsLoginHint) {
+            $script:ConnectParameters['LoginHint'] | Should -Be 'ada@contoso.com'
+        }
+        else {
+            $script:ConnectParameters.ContainsKey('LoginHint') | Should -BeFalse
+        }
     }
 
     It 'connects with the full scope set and the correct environment' {

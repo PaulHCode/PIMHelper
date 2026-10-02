@@ -196,6 +196,26 @@ supported directory role, for some group reads. Eligibility reads and `selfActiv
 should work regardless, but if a specific group fails this way, activate it from the
 Entra portal once and report the group type.
 
+**"Microsoft Graph signed in as … but Azure is signed in as …"**
+Every Graph session is checked against the account you signed in to Azure with, both
+when an existing session is reused and immediately after a new sign-in. Signing in
+again is not proof of *who* you signed in as: the WAM broker can satisfy a sign-in
+from a cached account without ever prompting. Sign out of the other account, or
+restart the tool and pick the matching one.
+
+The comparison is by home identity, not by literal text, because Azure reports your
+home UPN (`ada@contoso.com`) while Graph reports the B2B form in a tenant you guest
+into (`ada_contoso.com#EXT#@fabrikam.onmicrosoft.com`). Both resolve to the same
+person. If Graph reports no account at all — which happens when the session was
+created from a caller-supplied access token — the tool asks Graph who it is rather
+than letting the blank value pass.
+
+*Known limitation:* the check binds to the user principal name, which is mutable and
+re-assignable by an administrator. A durable binding would use the MSAL
+`HomeAccountId`, which is not available across all supported module versions. Within
+a single run of the tool the practical risk is negligible, but the check is a
+safeguard against an account switch, not an authentication boundary.
+
 **Activation succeeds but access does not work**
 Group-based access is evaluated at token issue time. Sign out and back in to the
 downstream application after activating.

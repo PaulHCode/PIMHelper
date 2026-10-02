@@ -1208,10 +1208,11 @@ function Test-PimAccountMatch {
         literal comparison would reject the valid sessions this tool exists to
         create, so both sides are folded to their home form first.
 
-        An absent name on either side means the comparison cannot be made at all,
-        which is reported as a match rather than a false accusation. A Graph
-        context built from a caller-supplied access token, for example, carries no
-        account.
+        When no account is expected there is nothing to enforce and everything
+        matches. When an account *is* expected, an unknown actual account is a
+        failure rather than a pass: a Graph context carries no account when it was
+        built from a caller-supplied token, and that context may belong to anyone.
+        Callers that can resolve the real principal should do so and pass it here.
     #>
     [CmdletBinding()]
     [OutputType([bool])]
@@ -1228,7 +1229,7 @@ function Test-PimAccountMatch {
     )
 
     if ([string]::IsNullOrWhiteSpace($Expected)) { return $true }
-    if ([string]::IsNullOrWhiteSpace($Actual)) { return $true }
+    if ([string]::IsNullOrWhiteSpace($Actual))   { return $false }
 
     $left  = ConvertTo-PimHomeAccountName -Account $Expected
     $right = ConvertTo-PimHomeAccountName -Account $Actual
