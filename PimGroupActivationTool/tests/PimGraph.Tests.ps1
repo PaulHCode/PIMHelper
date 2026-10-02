@@ -596,6 +596,42 @@ Describe 'Wait-PimDeviceCodeToken' {
             -LoginBaseUri 'https://login.microsoftonline.com' } | Should -Throw '*declined*'
     }
 
+    It 'gives up immediately when the service returns no token' {
+        # A reply the service accepted but that carries no token is not a transport
+        # problem, so it must not be retried like one.
+        $script:Attempts = 0
+        Set-PimCommandOverride -Name 'Start-Sleep' -Handler { param($p) }
+        Set-PimCommandOverride -Name 'Invoke-RestMethod' -Handler { param($p)
+            $script:Attempts++
+            [pscustomobject]@{ token_type = 'Bearer' }
+        }
+
+        $code = [pscustomobject]@{ DeviceCode = 'd'; IntervalSeconds = 5; ExpiresInSeconds = 900 }
+
+        { Wait-PimDeviceCodeToken -DeviceCode $code -TenantId '11111111-1111-1111-1111-111111111111' `
+            -LoginBaseUri 'https://login.microsoftonline.com' } | Should -Throw '*returned no access token*'
+
+        $script:Attempts | Should -Be 1 -Because 'a missing token is not worth twenty retries'
+    }
+
+    It 'never polls after the caller''s deadline has passed' {
+        # The sleep deliberately overruns the one second budget, so the only way to
+        # avoid a late poll is to recheck the deadline after waiting.
+        $script:Attempts = 0
+        Set-PimCommandOverride -Name 'Start-Sleep' -Handler { param($p) [System.Threading.Thread]::Sleep(1200) }
+        Set-PimCommandOverride -Name 'Invoke-RestMethod' -Handler { param($p)
+            $script:Attempts++
+            [pscustomobject]@{ access_token = 'late-token' }
+        }
+
+        $code = [pscustomobject]@{ DeviceCode = 'd'; IntervalSeconds = 5; ExpiresInSeconds = 900 }
+
+        { Wait-PimDeviceCodeToken -DeviceCode $code -TenantId '11111111-1111-1111-1111-111111111111' `
+            -LoginBaseUri 'https://login.microsoftonline.com' -TimeoutSeconds 1 } | Should -Throw '*No sign-in completed*'
+
+        $script:Attempts | Should -Be 0 -Because 'the wait consumed the whole budget, so there was no time left to poll'
+    }
+
     It 'stops waiting once the caller''s budget runs out' {
         Set-PimCommandOverride -Name 'Start-Sleep' -Handler { param($p) }
 

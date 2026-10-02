@@ -870,8 +870,24 @@ function Wait-PimDeviceCodeToken {
     $deadline = (Get-Date).AddSeconds([Math]::Min($TimeoutSeconds, [int]$DeviceCode.ExpiresInSeconds))
     $networkFailures = 0
 
-    while ((Get-Date) -lt $deadline) {
-        $null = Invoke-PimExternalCommand -Name 'Start-Sleep' -Parameters @{ Seconds = $interval }
+    while ($true) {
+        $remaining = ($deadline - (Get-Date)).TotalSeconds
+        if ($remaining -le 0) {
+            break
+        }
+
+        # Cap the wait at whatever time is left, then recheck, so a long poll
+        # interval or an accumulated slow_down back-off cannot push an attempt
+        # past the caller's deadline - or let a sign-in succeed after the tool
+        # has already given up on it.
+        $sleepSeconds = [int][Math]::Ceiling([Math]::Min([double]$interval, $remaining))
+        $null = Invoke-PimExternalCommand -Name 'Start-Sleep' -Parameters @{ Seconds = $sleepSeconds }
+
+        if ((Get-Date) -ge $deadline) {
+            break
+        }
+
+        $token = $null
 
         try {
             $token = Invoke-PimExternalCommand -Name 'Invoke-RestMethod' -Parameters @{
@@ -885,13 +901,6 @@ function Wait-PimDeviceCodeToken {
                 }
                 ErrorAction = 'Stop'
             }
-
-            $accessToken = [string](Get-PimPropertyValue -InputObject $token -Name 'access_token')
-            if ([string]::IsNullOrWhiteSpace($accessToken)) {
-                throw 'The identity service accepted the device code but returned no access token.'
-            }
-
-            return $accessToken
         }
         catch {
             $failure = $_
@@ -925,6 +934,20 @@ function Wait-PimDeviceCodeToken {
                 Write-PimLog -Level Warning -Operation 'Connect-Graph' -TenantId $TenantId -Status 'PollFailed' `
                     -Message "Could not reach the identity service ($networkFailures/20), still waiting. $($failure.Exception.Message)"
             }
+
+            $token = $null
+        }
+
+        # Checked outside the catch on purpose. A reply the service accepted but
+        # that carries no token is not a transport problem, so retrying it twenty
+        # times would just stall the user behind a failure that cannot improve.
+        if ($null -ne $token) {
+            $accessToken = [string](Get-PimPropertyValue -InputObject $token -Name 'access_token')
+            if ([string]::IsNullOrWhiteSpace($accessToken)) {
+                throw 'The identity service accepted the device code but returned no access token.'
+            }
+
+            return $accessToken
         }
     }
 
