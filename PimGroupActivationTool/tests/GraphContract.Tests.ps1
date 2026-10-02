@@ -19,6 +19,9 @@
 BeforeAll {
     $script:SrcPath = Join-Path -Path (Split-Path -Parent $PSScriptRoot) -ChildPath 'src'
     Import-Module (Join-Path $script:SrcPath 'PimModels.psm1') -Force
+    Import-Module (Join-Path $script:SrcPath 'PimLogging.psm1') -Force
+    Import-Module (Join-Path $script:SrcPath 'PimGraph.psm1') -Force
+    Initialize-PimLog -Disable | Out-Null
 
     $script:MetadataUri = 'https://graph.microsoft.com/v1.0/$metadata'
     $script:Types = $null
@@ -115,7 +118,8 @@ BeforeAll {
 }
 
 AfterAll {
-    Remove-Module PimModels -Force -ErrorAction SilentlyContinue
+    Clear-PimCommandOverride
+    Remove-Module PimGraph, PimLogging, PimModels -Force -ErrorAction SilentlyContinue
 }
 
 Describe 'Graph activation request contract' {
@@ -179,5 +183,68 @@ Describe 'Graph activation request contract' {
         foreach ($name in @('assignmentScheduleRequests', 'assignmentSchedules', 'eligibilitySchedules')) {
             $navigations | Should -Contain $name -Because "the tool builds a URL ending in '$name'"
         }
+    }
+
+    It 'puts a schema-valid body on the wire, not just in the builder' {
+        if ($script:SkipReason) { return }
+
+        # The checks above validate a body built in isolation. They say nothing
+        # about what Request-PimGroupActivation actually transmits, so a change to
+        # the POST could send a different shape and still pass. This captures the
+        # real request at the network boundary and holds that against the schema.
+        $captured = $null
+        Set-PimCommandOverride -Name 'Invoke-MgGraphRequest' -Handler { param($p)
+            $script:CapturedBody   = $p['Body']
+            $script:CapturedUri    = $p['Uri']
+            $script:CapturedMethod = $p['Method']
+            return @{ id = 'request-123'; status = 'Provisioned' }
+        }
+
+        try {
+            $null = Request-PimGroupActivation `
+                -TenantId '11111111-1111-1111-1111-111111111111' `
+                -PrincipalId '22a090af-a24c-4658-b466-9373747cb69e' `
+                -GroupId 'c2af020b-e23a-49f6-99bb-f7380855756a' `
+                -GroupDisplayName 'Contract Test Group' `
+                -AccessId 'member' `
+                -Justification 'Contract test of the transmitted body' `
+                -Duration ([TimeSpan]::FromHours(2)) `
+                -TicketNumber '12345' `
+                -TicketSystem 'Helpdesk' `
+                -GraphBaseUri 'https://graph.microsoft.com' `
+                -Confirm:$false
+        }
+        finally {
+            Clear-PimCommandOverride
+        }
+
+        $script:CapturedMethod | Should -Be 'POST'
+        $script:CapturedUri    | Should -Be 'https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/assignmentScheduleRequests'
+        $script:CapturedBody   | Should -Not -BeNullOrEmpty
+
+        # It goes out as JSON, so check the JSON rather than the hashtable behind it.
+        $captured = $script:CapturedBody | ConvertFrom-Json
+
+        $walk = {
+            param($Node, [string] $TypeName, [string] $Prefix)
+
+            foreach ($property in $Node.PSObject.Properties) {
+                $members = Get-PimEdmMember -TypeName $TypeName
+                $members.Count | Should -BeGreaterThan 0 -Because "Graph should declare the type '$TypeName'"
+
+                $exact = @($members.Keys | Where-Object { [string]::Equals($_, $property.Name, [System.StringComparison]::Ordinal) })
+                $exact.Count | Should -Be 1 -Because "Graph rejects '$Prefix$($property.Name)' - $TypeName declares no member spelled exactly that way"
+
+                if ($property.Value -is [System.Management.Automation.PSCustomObject]) {
+                    $childType = Get-PimEdmTypeName -EdmType $members[$exact[0]]
+                    & $walk $property.Value $childType "$Prefix$($property.Name)."
+                }
+            }
+        }
+
+        $propertyCount = @($captured.PSObject.Properties).Count
+        $propertyCount | Should -BeGreaterThan 0 -Because 'an empty request would make this check vacuous'
+
+        & $walk $captured 'privilegedAccessGroupAssignmentScheduleRequest' ''
     }
 }
