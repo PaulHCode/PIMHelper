@@ -269,8 +269,77 @@ Describe 'Get-PimAsyncStreamText' {
     }
 }
 
-Describe 'New-PimDataGridView' {
-    It 'disables auto-generated columns and row editing' {
+Describe 'Device code visibility' {
+    It 'surfaces the user code from a real worker runspace' {
+        # The whole reason the tool runs the device code flow itself is so the code
+        # can be shown in the window. Everything else about that redesign is moot if
+        # the code does not survive the trip out of the worker runspace, so this runs
+        # the real Connect-PimGraphWithDeviceCode on a real worker and drains it the
+        # same way the UI timer does. Only the HTTP calls are faked.
+        $srcDir = Join-Path -Path (Split-Path -Parent $PSScriptRoot) -ChildPath 'src'
+        $graphPath = Join-Path -Path $srcDir -ChildPath 'PimGraph.psm1'
+        $modelsPath = Join-Path -Path $srcDir -ChildPath 'PimModels.psm1'
+
+        $operation = Start-PimAsyncOperation -Name 'DeviceCode' -Parameters @{ GraphPath = $graphPath; ModelsPath = $modelsPath } -Script {
+            param($GraphPath, $ModelsPath, $Shared)
+
+            Import-Module $ModelsPath -Force -DisableNameChecking
+            Import-Module $GraphPath -Force -DisableNameChecking
+
+            Set-PimCommandOverride -Name 'Start-Sleep' -Handler { param($p) }
+            Set-PimCommandOverride -Name 'Invoke-RestMethod' -Handler {
+                param($p)
+                if ($p.Uri -match '/devicecode$') {
+                    return [pscustomobject]@{
+                        device_code      = 'device-code-value'
+                        user_code        = 'TESTCODE9'
+                        verification_uri = 'https://login.microsoftonline.com/device'
+                        expires_in       = 900
+                        interval         = 5
+                    }
+                }
+
+                return [pscustomobject]@{ access_token = 'token-value' }
+            }
+            Set-PimCommandOverride -Name 'Connect-MgGraph' -Handler { param($p) }
+            Set-PimCommandOverride -Name 'Get-MgContext' -Handler {
+                param($p)
+                [pscustomobject]@{ TenantId = '11111111-1111-1111-1111-111111111111'; Account = 'ada@contoso.com'; Scopes = @('User.Read') }
+            }
+
+            $cloud = Get-PimCloudConfiguration -Name 'Commercial'
+            $null = Connect-PimGraphWithDeviceCode -TenantId '11111111-1111-1111-1111-111111111111' `
+                -CloudConfiguration $cloud -Scope (Get-PimMinimumGraphScope)
+            'done'
+        }
+
+        try {
+            $deadline = (Get-Date).AddSeconds(60)
+            $lines = New-Object System.Collections.Generic.List[object]
+            while ((Get-Date) -lt $deadline) {
+                foreach ($line in (Get-PimAsyncStreamText -Operation $operation)) { $lines.Add($line) }
+                if ($operation.Handle.IsCompleted) { break }
+                Start-Sleep -Milliseconds 50
+            }
+
+            foreach ($line in (Get-PimAsyncStreamText -Operation $operation)) { $lines.Add($line) }
+
+            $codeLine = @($lines | Where-Object { $_.Text -match 'TESTCODE9' })
+            $codeLine.Count | Should -BeGreaterThan 0 -Because 'a code the user cannot see is the bug this design exists to fix'
+            $codeLine[0].Level | Should -Be 'Warning'
+            $codeLine[0].Text  | Should -Match 'login\.microsoftonline\.com/device'
+
+            # The secret half of the exchange must never be shown alongside it.
+            @($lines | Where-Object { $_.Text -match 'device-code-value|token-value' }).Count |
+                Should -Be 0 -Because 'only the user code is meant to be displayed'
+        }
+        finally {
+            $null = Complete-PimAsyncOperation -Operation $operation
+        }
+    }
+}
+
+Describe 'New-PimDataGridView' {    It 'disables auto-generated columns and row editing' {
         $grid = New-PimDataGridView -Name 'test'
         try {
             $grid.AutoGenerateColumns   | Should -BeFalse
