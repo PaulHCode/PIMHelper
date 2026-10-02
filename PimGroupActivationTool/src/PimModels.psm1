@@ -970,7 +970,7 @@ function ConvertTo-PimSafeCsvValue {
 # Ordered list of matchers that turn a raw Graph/MSAL failure into something a
 # non-PowerShell user can act on.
 $script:FriendlyErrorRules = @(
-    @{ Pattern = '(?i)AADSTS65001|consent_required|interaction_required.*consent'; Message = 'The tenant has not consented to the Microsoft Graph PowerShell permissions this tool needs. Ask a Global Administrator or Privileged Role Administrator in that tenant to grant admin consent.' }
+    @{ Pattern = '(?i)AADSTS65001|AADSTS90094|consent_required|interaction_required.*consent|admin[_ ]approval'; Message = 'The tenant has not consented to the Microsoft Graph PowerShell permissions this tool needs. Ask a Global Administrator or Privileged Role Administrator in that tenant to grant admin consent.' }
     @{ Pattern = '(?i)AADSTS50076|AADSTS50079|AADSTS50158|strong authentication|multi-?factor'; Message = 'Multi-factor authentication or an additional Conditional Access requirement must be satisfied in this tenant. Re-run sign-in and complete the prompt.' }
     @{ Pattern = '(?i)AADSTS53003|blocked by Conditional Access|AADSTS50105'; Message = 'Conditional Access or a tenant policy blocked this sign-in. Contact the tenant administrator.' }
     @{ Pattern = '(?i)AADSTS50020|AADSTS700016|user account .* does not exist in tenant|does not exist in tenant'; Message = 'Your account does not have access to this tenant. Confirm the B2B guest invitation was accepted.' }
@@ -984,8 +984,15 @@ $script:FriendlyErrorRules = @(
     @{ Pattern = '(?i)RoleAssignmentExists|RoleAssignmentRequestPolicyValidationFailed.*already|already active|PendingRoleAssignmentRequest|existing.*request'; Message = 'An active or pending activation already exists for this group.' }
     @{ Pattern = '(?i)ticket.*(required|information)|RoleAssignmentRequestTicketInfo'; Message = 'This group''s activation policy requires ticket information. Provide a ticket number and ticket system, then resubmit.' }
     @{ Pattern = '(?i)justification.*(required|missing)'; Message = 'This group''s activation policy requires a justification. Provide one and resubmit.' }
-    @{ Pattern = '(?i)approv'; Message = 'This group''s activation policy requires approval. The request was not completed; an approver must act on it.' }
     @{ Pattern = '(?i)RoleAssignmentRequestPolicyValidationFailed.*(duration|expiration|maximum)|exceeds.*maximum|maximum.*duration|duration.*(exceed|not allowed|longer)'; Message = 'The requested duration exceeds the activation policy for this group. Choose a shorter duration.' }
+
+    # Matching a bare "approv" here was worse than no rule at all: it caught the
+    # admin-consent failure AADSTS90094, the duration message that ends "An
+    # approver is not required", and a RoleNotEligible reply that merely mentions
+    # approval settings - each one sending the user to wait on an approver who
+    # does not exist. The wording has to name approval as the thing being
+    # demanded, and the specific policy rules above get first refusal.
+    @{ Pattern = '(?i)RoleAssignmentRequestPolicyValidationFailed.*\bapprov|requires?\s+approval|approval\s+(is\s+)?required|(pending|awaiting)\s+approval|ApprovalRule|PendingApproval|approver\s+must\s+(act|approve)'; Message = 'This group''s activation policy requires approval. The request was not completed; an approver must act on it.' }
 
     # Anything else the policy rejects. The raw text is the only clue to which
     # rule failed, so it is surfaced rather than replaced with a guess.

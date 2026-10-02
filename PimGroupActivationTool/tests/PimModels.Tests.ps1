@@ -674,6 +674,36 @@ Describe 'Format-PimGraphError' {
         (Format-PimGraphError -ErrorObject $raw).FriendlyMessage | Should -Match $Expected
     }
 
+    # The approval rule used to match a bare "approv" anywhere in the text, which
+    # quietly captured three unrelated failures and sent the user off to wait for
+    # an approver who did not exist. Each of these reproduces one of them.
+    It 'does not mistake <Name> for a pending approval' -ForEach @(
+        @{
+            Name     = 'an admin-consent failure'
+            Raw      = 'AADSTS90094: Grant_management_for_this_application_requires_admin_approval. An administrator of the tenant must grant consent.'
+            Expected = 'grant admin consent'
+        }
+        @{
+            Name     = 'a duration failure that says no approver is needed'
+            Raw      = '{"error":{"code":"RoleAssignmentRequestPolicyValidationFailed","message":"The requested duration exceeds the maximum allowed by policy. An approver is not required."}}'
+            Expected = 'duration exceeds'
+        }
+        @{
+            Name     = 'an ineligibility that merely mentions approval settings'
+            Raw      = '{"error":{"code":"RoleNotEligible","message":"Approval settings unchanged. The principal has no eligible assignment."}}'
+            Expected = 'not eligible'
+        }
+    ) {
+        $message = (Format-PimGraphError -ErrorObject $Raw).FriendlyMessage
+        $message | Should -Match $Expected
+        $message | Should -Not -Match 'an approver must act'
+    }
+
+    It 'still recognises a genuine approval requirement' {
+        (Format-PimGraphError -ErrorObject '{"error":{"code":"RoleAssignmentRequestPolicyValidationFailed","message":"This assignment requires approval from an approver."}}').FriendlyMessage |
+            Should -Match 'requires approval'
+    }
+
     It 'surfaces the policy message verbatim when no specific rule recognises it' {
         $raw = '{"error":{"code":"RoleAssignmentRequestPolicyValidationFailed","message":"Rule MfaRule was not satisfied."}}'
         $friendly = (Format-PimGraphError -ErrorObject $raw).FriendlyMessage
